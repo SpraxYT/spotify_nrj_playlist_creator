@@ -2,7 +2,7 @@
 
 Ajoute automatiquement à une playlist Spotify les titres diffusés sur NRJ.
 
-Le script lit le titrage sur [nrj.fr/chansons-diffusees](https://www.nrj.fr/chansons-diffusees), cherche chaque morceau sur Spotify et l’ajoute sans doublon. Conçu pour PHP + cron (aaPanel ou équivalent).
+Le script lit le titrage NRJ (API JSON officielle pour le titre en cours ; historique via miroir / page [chansons-diffusees](https://www.nrj.fr/chansons-diffusees)), cherche chaque morceau sur Spotify et l’ajoute sans doublon. Conçu pour PHP + cron (aaPanel ou équivalent). La page HTML officielle est souvent bloquée par Cloudflare depuis une IP datacenter — le client bascule alors sur un miroir ou l’API.
 
 ## Prérequis
 
