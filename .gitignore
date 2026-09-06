@@ -1,0 +1,22 @@
+# Secrets et caches locaux
+.env
+.cache
+.cache-*
+data/seen_tracks.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.Python
+dist/
+build/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
