@@ -2,76 +2,71 @@
 
 Ajoute automatiquement à une playlist Spotify les titres diffusés sur NRJ.
 
-Le bot lit le titrage sur [nrj.fr/chansons-diffusees](https://www.nrj.fr/chansons-diffusees), cherche chaque morceau sur Spotify et l’ajoute sans doublon.
+Le script lit le titrage sur [nrj.fr/chansons-diffusees](https://www.nrj.fr/chansons-diffusees), cherche chaque morceau sur Spotify et l’ajoute sans doublon. Conçu pour PHP + cron (aaPanel ou équivalent).
 
 ## Prérequis
 
-- Python 3.10+
+- PHP 8.1+ avec extensions `curl` et `json` (recommandé)
 - Compte Spotify + [application Developer Dashboard](https://developer.spotify.com/dashboard)
 - Une playlist Spotify dont vous êtes propriétaire
 
-## Configuration Spotify
+## Configuration
 
-1. Créez une app sur le Dashboard Spotify et récupérez le Client ID / Client Secret.
-2. Ajoutez la Redirect URI : `http://127.0.0.1:8888/callback`
-3. Récupérez l’ID de playlist dans l’URL :
-
-   `https://open.spotify.com/playlist/`**`XXXXXXXX`**
-
-## Installation
+1. Créez une app Spotify et récupérez Client ID / Client Secret.
+2. Ajoutez une Redirect URI (ex. `https://votre-domaine.tld/auth.php`).
+3. Copiez la config :
 
 ```bash
-git clone git@github.com:SpraxYT/spotify_nrj_playlist_creator.git
-cd spotify_nrj_playlist_creator
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+cp config.example.php config.php
 ```
 
-Renseignez `.env` (ne committez jamais ce fichier) :
+Renseignez `config.php` (ne le committez jamais) :
 
-```env
-SPOTIFY_CLIENT_ID=...
-SPOTIFY_CLIENT_SECRET=...
-SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
-SPOTIFY_PLAYLIST_ID=...
-NRJ_WEBRADIO_ID=158
-POLL_INTERVAL_SECONDS=45
-```
-
-| Variable | Description |
+| Clé | Description |
 |---|---|
+| `SPOTIFY_*` | Identifiants app + Redirect URI + ID playlist |
 | `NRJ_WEBRADIO_ID` | `158` = NRJ FM, `1` = NRJ HITS |
-| `POLL_INTERVAL_SECONDS` | Intervalle entre deux vérifications (minimum 15 s) |
+| `CRON_SECRET` | Secret pour `run.php` et la page historique |
+
+## Autorisation (une fois)
+
+Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json`.
 
 ## Utilisation
 
-Au premier lancement, Spotipy ouvre le navigateur pour l’autorisation OAuth. Le token est stocké dans `.cache`.
-
 ```bash
-# Boucle continue
-python bot.py
+# Titre en cours (cron)
+php run.php
 
-# Un seul cycle (cron / test)
-python bot.py --once
-
-# Import de l'historique récent NRJ, puis arrêt
-python bot.py --backfill
+# Import historique (CLI)
+php run.php --backfill
 ```
 
-`--backfill` ajoute les titres présents sur la page d’historique qui manquent encore dans la playlist. Ensuite, lancez `python bot.py` pour suivre le live.
+HTTP :
 
-Le fichier `data/seen_tracks.json` mémorise les titres déjà traités.
+```bash
+curl "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET"
+```
+
+### Page historique (manuel)
+
+Ouvrez `history.php`, saisissez `CRON_SECRET`, cliquez sur **Récupérer l’historique NRJ**, puis **Ajouter à la playlist Spotify**.
+
+L’accueil `index.php` regroupe les liens (auth, historique, run).
+
+Logs : stdout + `data/run.log`. Cache : `data/cache.json`.
 
 ## Fichiers
 
 | Fichier | Rôle |
 |---|---|
-| `bot.py` | Point d’entrée (boucle, `--once`, `--backfill`) |
-| `nrj_client.py` | Lecture du titrage / historique NRJ |
-| `spotify_client.py` | OAuth, recherche, dédoublonnage, ajout playlist |
-| `.env.example` | Modèle de configuration |
+| `run.php` | Cron / titre en cours / `--backfill` |
+| `history.php` | UI web historique → playlist |
+| `auth.php` | OAuth Spotify |
+| `index.php` | Accueil |
+| `src/` | Clients NRJ / Spotify, cache, HTTP |
+| `config.example.php` | Modèle de configuration |
+| `legacy/python/` | Ancienne version Python |
 
 ## Licence
 

@@ -1,10 +1,14 @@
-# Secrets et caches locaux
+# Secrets et données locales
+config.php
 .env
 .cache
 .cache-*
+data/token.json
+data/cache.json
 data/seen_tracks.json
+data/run.log
 
-# Python
+# Python (legacy)
 __pycache__/
 *.py[cod]
 *.egg-info/
