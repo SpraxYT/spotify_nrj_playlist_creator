@@ -7,12 +7,18 @@ declare(strict_types=1);
  *
  * CLI  : php run.php [--backfill]
  * HTTP : /run.php?key=CRON_SECRET[&backfill=1]
+ *
+ * Chaque passage : capture le titre en cours + synchronise l’historique miroir
+ * (titres musicaux manquants, max MAX_ADDS_PER_RUN) vers Spotify.
  */
 
 require __DIR__ . '/bootstrap.php';
 
 $root = __DIR__;
 $isCli = PHP_SAPI === 'cli';
+
+/** Limite d’ajouts Spotify par passage cron (rate limit). */
+const MAX_ADDS_PER_RUN = 8;
 
 try {
     $config = Config::load($root);
@@ -94,24 +100,86 @@ function process_once(
     NrjHistoryStore $history,
     Logger $logger
 ): void {
-    $song = $nrj->fetchCurrentSong();
-    if ($song === null) {
-        $logger->info('Aucun titre valide en cours (pub / pause).');
+    $current = $nrj->fetchCurrentSong();
+    if ($current !== null) {
+        if ($history->remember($current)) {
+            $logger->info('Historique local : nouveau titre (' . $history->count() . ').');
+        }
+    } else {
+        $logger->info('Aucun titre ICY/API valide en cours (pub / pause / promo).');
+    }
+
+    $batch = [];
+    try {
+        $remote = $nrj->fetchRecentSongs();
+        foreach (array_reverse($remote) as $song) {
+            $history->remember($song);
+        }
+        $batch = $remote;
+        $logger->info('Sync historique distant : ' . count($batch) . ' titre(s) musicaux.');
+    } catch (NrjClientError $e) {
+        $logger->info('Historique distant indisponible : ' . $e->getMessage());
+        if ($current !== null) {
+            $batch = [$current];
+        }
+    }
+
+    if ($batch === []) {
+        $logger->info('Rien à ajouter à Spotify pour ce passage.');
         return;
     }
 
-    if ($history->remember($song)) {
-        $logger->info('Historique local : nouveau titre enregistré (' . $history->count() . ').');
+    sync_pending($batch, $spotify, $logger, MAX_ADDS_PER_RUN);
+}
+
+/**
+ * @param list<NrjSong> $songs plus récents en premier (ou ordre quelconque)
+ */
+function sync_pending(
+    array $songs,
+    SpotifyClient $spotify,
+    Logger $logger,
+    int $maxAdds
+): void {
+    $pending = array_reverse($songs);
+    $counts = ['added' => 0, 'already' => 0, 'not_found' => 0, 'skipped' => 0, 'junk' => 0];
+    $adds = 0;
+
+    foreach ($pending as $song) {
+        if (NrjClient::isJunk($song->artist, $song->title)) {
+            $counts['junk']++;
+            continue;
+        }
+
+        if ($spotify->hasSeenNrjSong($song->songId)) {
+            $counts['skipped']++;
+            continue;
+        }
+
+        if ($adds >= $maxAdds) {
+            $logger->info(
+                'Plafond atteint (' . $maxAdds . ' ajouts / passage) — reste reporté au prochain cron.'
+            );
+            break;
+        }
+
+        $logger->info('Ajout Spotify : ' . $song->display() . ' (id=' . $song->songId . ')');
+        $status = $spotify->addTrack($song->songId, $song->artist, $song->title);
+        $counts[$status] = ($counts[$status] ?? 0) + 1;
+        if ($status === 'added') {
+            $adds++;
+        }
+        usleep(350000);
     }
 
-    if ($spotify->hasSeenNrjSong($song->songId)) {
-        $logger->info('Toujours en on-air (déjà traité) : ' . $song->display());
-        return;
-    }
-
-    $logger->info('Nouveau titre NRJ : ' . $song->display() . ' (id=' . $song->songId . ')');
-    $status = $spotify->addTrack($song->songId, $song->artist, $song->title);
-    $logger->info('Résultat : ' . $status);
+    $logger->info(sprintf(
+        'Sync terminée — ajoutés=%d, déjà=%d, introuvables=%d, cache=%d, promos ignorées=%d.',
+        $counts['added'],
+        $counts['already'],
+        $counts['not_found'],
+        $counts['skipped'],
+        $counts['junk']
+    ));
 }
 
 function run_backfill(
@@ -120,10 +188,9 @@ function run_backfill(
     NrjHistoryStore $history,
     Logger $logger
 ): void {
-    // Préférer l’historique local (construit par le cron hors Cloudflare).
     $songs = $history->songs();
     if ($songs === []) {
-        $logger->info('Historique local vide — tentative distant / titre en cours…');
+        $logger->info('Historique local vide — tentative distant…');
         try {
             $songs = $nrj->fetchRecentSongs();
             foreach (array_reverse($songs) as $song) {
@@ -145,29 +212,6 @@ function run_backfill(
         return;
     }
 
-    $logger->info('Backfill — ' . count($songs) . ' titre(s) dans l’historique local.');
-
-    $pending = array_reverse($songs);
-    $counts = ['added' => 0, 'already' => 0, 'not_found' => 0, 'skipped' => 0];
-
-    foreach ($pending as $song) {
-        if ($spotify->hasSeenNrjSong($song->songId)) {
-            $counts['skipped']++;
-            $logger->info('Déjà traité : ' . $song->display());
-            continue;
-        }
-
-        $logger->info('Backfill : ' . $song->display() . ' (id=' . $song->songId . ')');
-        $status = $spotify->addTrack($song->songId, $song->artist, $song->title);
-        $counts[$status] = ($counts[$status] ?? 0) + 1;
-        usleep(350000);
-    }
-
-    $logger->info(sprintf(
-        'Backfill terminé — ajoutés=%d, déjà présents=%d, introuvables=%d, ignorés(cache)=%d.',
-        $counts['added'],
-        $counts['already'],
-        $counts['not_found'],
-        $counts['skipped']
-    ));
+    $logger->info('Backfill — ' . count($songs) . ' titre(s) dans l’historique.');
+    sync_pending($songs, $spotify, $logger, 50);
 }

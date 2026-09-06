@@ -22,12 +22,15 @@ final class NrjHistoryStore
     }
 
     /**
-     * @return list<NrjSong> plus récents en premier
+     * @return list<NrjSong> plus récents en premier (promos exclues)
      */
     public function songs(): array
     {
         $out = [];
         foreach ($this->entries as $row) {
+            if (NrjClient::isJunk($row['artist'], $row['title'])) {
+                continue;
+            }
             $out[] = new NrjSong($row['song_id'], $row['artist'], $row['title']);
         }
         return $out;
@@ -52,6 +55,10 @@ final class NrjHistoryStore
      */
     public function remember(NrjSong $song): bool
     {
+        if (NrjClient::isJunk($song->artist, $song->title)) {
+            return false;
+        }
+
         if ($this->entries !== []) {
             $top = $this->entries[0];
             if ($top['song_id'] === $song->songId

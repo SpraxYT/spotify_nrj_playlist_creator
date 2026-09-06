@@ -69,6 +69,16 @@ Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `d
 | `config.example.php` | Modèle de configuration |
 | `legacy/python/` | Ancienne version Python |
 
+## Dépannage Spotify (HTTP 403)
+
+Si `history.php` affiche `403 Forbidden` :
+
+1. **Development mode** — [Dashboard](https://developer.spotify.com/dashboard) → votre app → **User Management** → Add user (e-mail du compte Spotify), puis rouvrez `auth.php`.
+2. **Propriétaire de la playlist** — `SPOTIFY_PLAYLIST_ID` doit être une playlist créée par **ce même compte** (pas un autre profil). Ex. `4DCkQ853je6ajt28tF6bef`.
+3. Consultez `data/run.log` : les lignes `Spotify connecté` et `Playlist … propriétaire` comparent les IDs.
+
+Les promos / jingles (ex. « NRJ EURO HOT 30 ») sont filtrées. Le cron `run.php` synchronise jusqu’à 8 titres musicaux manquants par passage via le miroir d’historique.
+
 ## Licence
 
 MIT — voir [LICENSE](LICENSE).
