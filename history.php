@@ -47,11 +47,28 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $action = (string) ($_POST['action'] ?? '');
 
     try {
+        $pollLogger = new Logger(__DIR__ . '/data/run.log', false);
         $nrj = new NrjClient(
             $config->string('NRJ_WEBRADIO_ID') ?: '158',
-            null,
+            $pollLogger,
             $config->string('NRJ_STREAM_URL') ?: null,
         );
+        $cacheForStale = new Cache(__DIR__ . '/data/cache.json');
+        $isStaleFallback = static function (NrjSong $song) use ($cacheForStale, $historyStore): bool {
+            if ($cacheForStale->isHandledSuccessfully($song->songId, $song->artist, $song->title)) {
+                return true;
+            }
+            $known = $historyStore->songs();
+            if ($known === []) {
+                return false;
+            }
+            $top = $known[0];
+            return $top->songId === $song->songId
+                || (
+                    str_lower($top->artist) === str_lower($song->artist)
+                    && str_lower($top->title) === str_lower($song->title)
+                );
+        };
 
         if ($action === 'fetch' || $action === 'poll_current' || $action === 'add' || $action === 'create_playlist') {
             // Toujours tenter le miroir pour rafraîchir l’historique local (liste complète)
@@ -61,7 +78,7 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $merged = $historyStore->mergeRemote($remote);
                     // Enrichir avec le titre ICY en cours s’il n’est pas déjà dans le miroir
                     try {
-                        $current = $nrj->fetchCurrentSong();
+                        $current = $nrj->fetchCurrentSong($isStaleFallback);
                         if ($current !== null) {
                             $historyStore->remember($current);
                         }
@@ -105,9 +122,9 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
 
         if ($action === 'poll_current') {
-            $current = $nrj->fetchCurrentSong();
+            $current = $nrj->fetchCurrentSong($isStaleFallback);
             if ($current === null) {
-                $info = 'Aucun titre musical en cours (pub, jingle ou métadonnée vide).';
+                $info = 'Aucun titre musical en cours (pub, jingle, périmé ou métadonnée vide).';
             } elseif ($historyStore->remember($current)) {
                 $info = 'Titre en cours enregistré : ' . $current->display();
             } else {

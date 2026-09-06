@@ -105,7 +105,11 @@ function process_once(
     Logger $logger
 ): void {
     // 1) Titre live (ICY si StreamTitle réel ; sinon radio-api / miroir pendant pub).
-    $live = $nrj->fetchCurrentSong();
+    // Repli déjà en playlist = périmé → attente ICY post-pub (voir NrjClient).
+    $isStale = static function (NrjSong $song) use ($spotify): bool {
+        return $spotify->isHandledSuccessfully($song->songId, $song->artist, $song->title);
+    };
+    $live = $nrj->fetchCurrentSong($isStale);
     if ($live !== null) {
         if ($history->remember($live)) {
             $logger->info('Historique local : nouveau titre live (' . $history->count() . ').');

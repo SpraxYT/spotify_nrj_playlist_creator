@@ -2,101 +2,77 @@
 
 Ajoute automatiquement à une playlist Spotify les titres diffusés sur NRJ.
 
-Le titre en cours est lu via les **métadonnées ICY** du flux `streaming.nrjaudio.fm` (hors Cloudflare), avec repli sur `radio-api.net` puis `www.nrj.fr` en dernier recours. Conçu pour PHP + cron (aaPanel / VPS) : les pages `nrj.fr` sont souvent en **403 Cloudflare** depuis une IP datacenter.
+Deux modes :
 
-## Prérequis
+| | **Python local** (`local_bot/`) | **PHP VPS** (`run.php`) |
+|---|---|---|
+| Usage | Machine chez vous (IP résidentielle) | Cron / aaPanel / serveur |
+| Now-playing | API NRJ → ICY → radio-api → miroir | ICY → radio-api → miroir (nrj.fr souvent CF) |
+| Config | `.env` à la racine | `config.php` |
 
-- PHP 8.1+ avec extensions `curl` et `json` (recommandé)
-- Compte Spotify + [application Developer Dashboard](https://developer.spotify.com/dashboard)
-- Une playlist Spotify dont vous êtes propriétaire
+Les promos (« NRJ EURO HOT 30 », etc.) sont filtrées. Un repli déjà en playlist
+est traité comme **périmé** : nouvel essai ICY après la pub.
 
-## Configuration
+## Bot Python local (recommandé chez soi)
 
-1. Créez une app Spotify et récupérez Client ID / Client Secret.
-2. Ajoutez une Redirect URI (ex. `https://votre-domaine.tld/auth.php`).
-3. Copiez la config :
+```bash
+cd "/home/aymcode/Bureau/AYMCODE/SPOTIFY BOT"
+
+# Venv (recréer si besoin)
+python3 -m venv .venv --without-pip   # si pip absent dans le venv
+# puis : curl -sS https://bootstrap.pypa.io/get-pip.py | .venv/bin/python
+# ou simplement :
+python3 -m venv .venv
+
+source .venv/bin/activate
+pip install -r local_bot/requirements.txt
+
+# .env à la racine (SPOTIFY_*, NRJ_WEBRADIO_ID, POLL_INTERVAL_SECONDS)
+cp local_bot/.env.example .env   # si pas encore de .env
+
+# Une passe
+python local_bot/bot.py --once
+
+# Historique miroir → titres manquants
+python local_bot/bot.py --backfill
+
+# Boucle
+python local_bot/bot.py
+
+# Raccourci
+./run_local.sh --once
+```
+
+Cache : `data/seen_tracks.json`. Token OAuth : `.cache` à la racine.
+
+## Bot PHP (VPS / cron)
+
+Prérequis : PHP 8.1+ (`curl`, `json`), playlist Spotify dont vous êtes propriétaire.
 
 ```bash
 cp config.example.php config.php
-```
-
-Renseignez `config.php` (ne le committez jamais) :
-
-| Clé | Description |
-|---|---|
-| `SPOTIFY_*` | Identifiants app + Redirect URI + ID playlist |
-| `NRJ_WEBRADIO_ID` | `158` = NRJ FM, `1` = NRJ HITS |
-| `NRJ_STREAM_URL` | Optionnel — URL du flux ICY (défaut selon webradio) |
-| `CRON_SECRET` | Secret pour `run.php` et la page historique (**à régénérer s’il a fuité**) |
-
-## Autorisation (une fois)
-
-Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json`.
-
-## Utilisation
-
-```bash
-# Titre en cours (cron) — ICY live d’abord, puis miroir newest-first
-php run.php
-
-# Import depuis l’historique local
+# renseigner SPOTIFY_*, CRON_SECRET, NRJ_WEBRADIO_ID
+php run.php          # live + sync miroir
 php run.php --backfill
 ```
 
-### Cron (recommandé : chaque minute)
+Cron recommandé (chaque minute) :
 
 ```cron
 * * * * * php /chemin/vers/run.php >/dev/null 2>&1
 ```
 
-Ou en HTTP : `* * * * * curl -s "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET" >/dev/null 2>&1`
+Auth une fois via `auth.php`. UI historique : `history.php`.
+Logs : `data/run.log`. Cache : `data/cache.json`.
 
-Pendant une **bannière pub** ICY (`adw_ad=true`), la musique joue déjà mais StreamTitle est vide :
-le bot bascule aussitôt sur radio-api / miroir et **ajoute le titre live à Spotify**
-(pas seulement l’historique local). Logs : `Ajout live : …` puis `Sync miroir …`.
-
-HTTP manuel :
-
-```bash
-curl "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET"
-```
-
-### Historique (manuel)
-
-Ouvrez `history.php` : liste l’historique **local** construit par le cron, permet de capturer le titre en cours et d’ajouter le lot à Spotify.
-
-Sur un VPS, l’historique distant `chansons-diffusees` est en général inaccessible (Cloudflare). Avec un cron **chaque minute**, l’ICY comble le retard du miroir.
-
-Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `data/nrj_history.json`.
-
-## Fichiers
-
-| Fichier | Rôle |
-|---|---|
-| `run.php` | Cron / titre en cours / `--backfill` |
-| `history.php` | UI historique miroir → playlist |
-| `debug.php` | Diagnostic Spotify (me/owner/scopes/test add) |
-| `auth.php` | OAuth Spotify |
-| `index.php` | Accueil |
-| `src/` | Clients NRJ / Spotify, cache, HTTP |
-| `config.example.php` | Modèle de configuration |
-| `legacy/python/` | Ancienne version Python |
+Pendant une **bannière pub** ICY, un titre radio-api déjà en playlist est rejeté
+(`repli radio-api périmé…`) puis le bot attend un vrai StreamTitle (~15–25 s).
 
 ## Dépannage Spotify (HTTP 403)
 
-Si `history.php` affiche `403 Forbidden` :
-
-1. **Endpoint fév. 2026** — l’ajout doit utiliser `POST /v1/playlists/{id}/items`
-   (l’ancien `/tracks` renvoie **403** en Development Mode, même si vous êtes propriétaire).
-2. **Development mode** — [Dashboard](https://developer.spotify.com/dashboard) → votre app
-   (**NRJ TUBE**) → **User Management** → Add user, puis rouvrez `auth.php`.
-3. **Propriétaire** — seulement si `me.id` ≠ `owner.id` (voir `debug.php`).
-4. Ouvrez `debug.php?key=CRON_SECRET` : compare me/owner, scopes du token, bouton
-   **Test ajout 1 titre**.
-
-Les promos / jingles (ex. « NRJ EURO HOT 30 ») sont filtrées. Le bouton
-« Récupérer l’historique NRJ » charge le **miroir complet** (~30–40 titres), fusionné
-avec l’historique ICY/local.
+1. Endpoint fév. 2026 : `POST /v1/playlists/{id}/items` (pas `/tracks`).
+2. Development mode → User Management → Add user, puis `auth.php`.
+3. `debug.php?key=CRON_SECRET` pour me/owner / test d’ajout.
 
 ## Licence
 

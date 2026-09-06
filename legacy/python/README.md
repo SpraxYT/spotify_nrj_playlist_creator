@@ -1,12 +1,11 @@
-# Ancienne version Python
+# Legacy Python
 
-Conservée pour référence. Le projet principal est désormais en PHP à la racine du dépôt.
+Ancienne version. Utilisez plutôt **`local_bot/`** à la racine :
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# depuis la racine du dépôt, avec chemins adaptés
-python legacy/python/bot.py --once
+./run_local.sh --once
+# ou
+python local_bot/bot.py --once
 ```
+
+Voir le README principal.

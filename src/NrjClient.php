@@ -38,8 +38,13 @@ final class NrjClient
     private const TIMEOUT = 12;
     private const ICY_TIMEOUT = 8;
     private const ICY_MAX_BLOCKS = 10;
-    /** Une seule passe : si pub Adswizz → repli immédiat (pas d’attente). */
+    /** Première lecture ICY (connexion unique). */
     private const ICY_MAX_ATTEMPTS = 1;
+    /** Attente post-preroll pour un vrai StreamTitle (pub ~13–30 s). */
+    private const ICY_POST_AD_WAIT_SEC = 22;
+    private const ICY_POST_AD_INTERVAL_US = 2_500_000;
+    private const ICY_POST_AD_MIN_SEC = 15;
+    private const ICY_POST_AD_MAX_SEC = 25;
 
     /** Flux MP3 connus (hors Cloudflare). */
     private const STREAM_URLS = [
@@ -65,14 +70,19 @@ final class NrjClient
     /**
      * Titre en cours.
      *
-     * ICY n’est fiable que si StreamTitle est un vrai titre. Pendant la bannière
-     * pub Adswizz (adw_ad=true, StreamTitle vide), la musique joue déjà : on
-     * bascule immédiatement sur radio-api puis le plus récent du miroir.
+     * Priorité : StreamTitle ICY réel (hors pub / hors promo). Pendant une
+     * bannière Adswizz, radio-api retarde souvent d’un titre : un repli déjà
+     * en playlist (ou « last live ») est traité comme périmé, puis on attend
+     * un vrai StreamTitle (~15–25 s) avant miroir / API.
+     *
+     * @param null|callable(NrjSong):bool $isStaleFallback
+     *        true = candidat repli déjà connu (playlist / dernier live) → ignorer
      */
-    public function fetchCurrentSong(): ?NrjSong
+    public function fetchCurrentSong(?callable $isStaleFallback = null): ?NrjSong
     {
         $errors = [];
         $icyAdBanner = false;
+        $adDurationMs = 0;
 
         try {
             $icy = $this->fetchCurrentFromIcy();
@@ -80,11 +90,15 @@ final class NrjClient
                 $this->logger?->info('Titre via ICY stream : ' . $icy['song']->display());
                 return $icy['song'];
             }
-            if ($icy['ad_banner']) {
+            if (!empty($icy['junk'])) {
+                $errors[] = 'ICY : titre promo / jingle ignoré';
+                $this->logger?->info('ICY : StreamTitle promo ignoré (EURO HOT / jingle).');
+            } elseif ($icy['ad_banner']) {
                 $icyAdBanner = true;
+                $adDurationMs = (int) ($icy['ad_duration_ms'] ?? 0);
                 $this->logger?->info(
-                    'ICY : bannière pub (adw_ad) — musique déjà à l’antenne, '
-                    . 'repli immédiat radio-api / miroir.'
+                    'ICY : bannière pub (adw_ad) — repli radio-api / miroir '
+                    . '(rejet si périmé, puis nouvel essai ICY).'
                 );
                 $errors[] = 'ICY : bannière pub (méta ad seulement)';
             } else {
@@ -95,26 +109,58 @@ final class NrjClient
             $this->logger?->warning('ICY indisponible : ' . $e->getMessage());
         }
 
+        $radioSong = null;
         try {
-            $song = $this->fetchCurrentFromRadioApi();
-            if ($song !== null) {
-                $src = $icyAdBanner ? 'radio-api.net (repli pub ICY)' : 'radio-api.net';
-                $this->logger?->info('Titre via ' . $src . ' : ' . $song->display());
-                return $song;
+            $radioSong = $this->fetchCurrentFromRadioApi();
+            if ($radioSong !== null) {
+                if ($this->isFallbackStale($radioSong, $isStaleFallback)) {
+                    $this->logger?->info(
+                        'repli radio-api périmé (déjà en playlist), nouvel essai ICY… — '
+                        . $radioSong->display()
+                    );
+                    $errors[] = 'radio-api : périmé (déjà en playlist) ' . $radioSong->display();
+                    $radioSong = null;
+                } else {
+                    $src = $icyAdBanner ? 'radio-api.net (repli pub ICY)' : 'radio-api.net';
+                    $this->logger?->info('Titre via ' . $src . ' : ' . $radioSong->display());
+                    return $radioSong;
+                }
+            } else {
+                $errors[] = 'radio-api : aucun titre valide';
             }
-            $errors[] = 'radio-api : aucun titre valide';
         } catch (NrjClientError $e) {
             $errors[] = 'radio-api : ' . $e->getMessage();
             $this->logger?->warning('radio-api indisponible : ' . $e->getMessage());
         }
 
+        // Pub / métadonnée vide / repli périmé : attendre un StreamTitle post-preroll.
+        if ($icyAdBanner || $radioSong === null) {
+            $waited = $this->waitForIcyAfterAd($adDurationMs);
+            if ($waited !== null) {
+                $this->logger?->info(
+                    'Titre via ICY stream (après pub) : ' . $waited->display()
+                );
+                return $waited;
+            }
+            $errors[] = 'ICY : pas de StreamTitle après attente post-pub';
+        }
+
         try {
             $song = $this->fetchCurrentFromNrjApi();
             if ($song !== null) {
-                $this->logger?->info('Titre via API nrj.fr : ' . $song->display());
-                return $song;
+                if ($this->isFallbackStale($song, $isStaleFallback)) {
+                    $this->logger?->info(
+                        'repli nrj.fr API périmé (déjà en playlist), essai miroir… — '
+                        . $song->display()
+                    );
+                    $errors[] = 'nrj.fr API : périmé ' . $song->display();
+                } else {
+                    $this->logger?->info('Titre via API nrj.fr : ' . $song->display());
+                    return $song;
+                }
+            } else {
+                $errors[] = 'nrj.fr API : aucun titre valide';
             }
-            $errors[] = 'nrj.fr API : aucun titre valide';
         } catch (NrjClientError $e) {
             $errors[] = 'nrj.fr API : ' . $e->getMessage();
             $this->logger?->warning(
@@ -122,19 +168,27 @@ final class NrjClient
             );
         }
 
-        // Pendant/après pub : plus récent titre musical du miroir = « now playing ».
+        // Miroir re-fetch : plus récent titre musical non périmé (hors promo).
         try {
             $recent = $this->fetchRecentSongs();
             foreach ($recent as $song) {
-                if (!self::isJunk($song->artist, $song->title)) {
-                    $src = $icyAdBanner
-                        ? 'miroir (repli pub ICY)'
-                        : 'miroir (fallback)';
-                    $this->logger?->info('Titre via ' . $src . ' : ' . $song->display());
-                    return $song;
+                if (self::isJunk($song->artist, $song->title)) {
+                    continue;
                 }
+                if ($this->isFallbackStale($song, $isStaleFallback)) {
+                    $this->logger?->info(
+                        'repli miroir périmé (déjà en playlist), suivant… — '
+                        . $song->display()
+                    );
+                    continue;
+                }
+                $src = $icyAdBanner
+                    ? 'miroir (repli pub ICY)'
+                    : 'miroir (fallback)';
+                $this->logger?->info('Titre via ' . $src . ' : ' . $song->display());
+                return $song;
             }
-            $errors[] = 'historique : aucun titre musical (promos filtrées)';
+            $errors[] = 'historique : aucun titre musical frais (promos / périmés filtrés)';
         } catch (NrjClientError $e) {
             $errors[] = 'historique : ' . $e->getMessage();
         }
@@ -142,6 +196,74 @@ final class NrjClient
         $this->logger?->info(
             'Aucun titre NRJ valide en cours. ' . implode(' | ', $errors)
         );
+        return null;
+    }
+
+    /**
+     * @param null|callable(NrjSong):bool $isStaleFallback
+     */
+    private function isFallbackStale(NrjSong $song, ?callable $isStaleFallback): bool
+    {
+        if (self::isJunk($song->artist, $song->title)) {
+            return true;
+        }
+        if ($isStaleFallback === null) {
+            return false;
+        }
+        return (bool) $isStaleFallback($song);
+    }
+
+    /**
+     * Relit le flux ICY pendant ~15–25 s (durée pub si connue) jusqu’à un
+     * StreamTitle musical — prioritaire sur tout repli périmé.
+     */
+    private function waitForIcyAfterAd(int $adDurationMs = 0): ?NrjSong
+    {
+        $waitSec = self::ICY_POST_AD_WAIT_SEC;
+        if ($adDurationMs > 0) {
+            $fromAd = (int) ceil($adDurationMs / 1000) + 2;
+            $waitSec = max(
+                self::ICY_POST_AD_MIN_SEC,
+                min(self::ICY_POST_AD_MAX_SEC, $fromAd)
+            );
+        }
+
+        $deadline = microtime(true) + $waitSec;
+        $attempt = 0;
+        $this->logger?->info(
+            sprintf(
+                'ICY : attente StreamTitle post-pub jusqu’à %d s…',
+                $waitSec
+            )
+        );
+
+        while (microtime(true) < $deadline) {
+            $attempt++;
+            usleep(self::ICY_POST_AD_INTERVAL_US);
+            try {
+                $icy = $this->fetchCurrentFromIcy();
+            } catch (NrjClientError $e) {
+                $this->logger?->warning(
+                    'ICY essai #' . $attempt . ' : ' . $e->getMessage()
+                );
+                continue;
+            }
+            if ($icy['song'] !== null) {
+                return $icy['song'];
+            }
+            if (!empty($icy['junk'])) {
+                $this->logger?->info(
+                    'ICY essai #' . $attempt . ' : promo ignorée, on continue…'
+                );
+                continue;
+            }
+            if ($icy['ad_banner']) {
+                $this->logger?->info(
+                    'ICY essai #' . $attempt . ' : pub toujours en cours…'
+                );
+            }
+        }
+
         return null;
     }
 
@@ -201,6 +323,8 @@ final class NrjClient
 
     /**
      * Promo / jingle / habillage on-air — à exclure de Spotify et des listes UI.
+     * Toute occurrence EURO HOT / NRJ EURO / EUROHOT / « hits les plus diffusés »
+     * est rejetée (ICY, radio-api, miroir, live, history).
      */
     public static function isJunk(string $artist, string $title): bool
     {
@@ -209,6 +333,12 @@ final class NrjClient
         }
 
         $combined = str_lower($artist . ' ' . $title);
+        $normalized = str_replace(
+            ['é', 'è', 'ê', 'ë', 'à', 'â', 'ù', 'û', 'ô', 'î', 'ï', 'ç'],
+            ['e', 'e', 'e', 'e', 'a', 'a', 'u', 'u', 'o', 'i', 'i', 'c'],
+            $combined
+        );
+        $compact = (string) preg_replace('/\s+/', '', $normalized);
         $artistU = strtoupper(trim($artist));
         $titleU = strtoupper(trim($title));
 
@@ -218,7 +348,8 @@ final class NrjClient
 
         $promoNeedles = [
             'hit music only',
-            'euro hot 30',
+            'euro hot',
+            'eurohot',
             'nrj euro',
             'hits les plus diffus',
             '30 hits les plus',
@@ -228,6 +359,7 @@ final class NrjClient
             'habillage',
             'indicatif',
             'publicité',
+            'publicite',
             'jingle pub',
             'spot pub',
             'pub nrj',
@@ -235,7 +367,15 @@ final class NrjClient
             'webradio',
         ];
         foreach ($promoNeedles as $kw) {
-            if (str_contains($combined, $kw)) {
+            $kwNorm = str_replace(
+                ['é', 'è', 'ê'],
+                ['e', 'e', 'e'],
+                $kw
+            );
+            if (
+                str_contains($normalized, $kwNorm)
+                || str_contains($compact, str_replace(' ', '', $kwNorm))
+            ) {
                 return true;
             }
         }
@@ -259,69 +399,95 @@ final class NrjClient
 
     /**
      * Lecture ICY fraîche (connexion close, pas de keep-alive).
-     * Si bannière pub → ad_banner=true, song=null (ne pas attendre la fin de pub).
      *
-     * @return array{song:?NrjSong,ad_banner:bool}
+     * @return array{song:?NrjSong,ad_banner:bool,junk:bool,ad_duration_ms:int}
      */
     private function fetchCurrentFromIcy(): array
     {
-        $lastMeta = '';
-        for ($attempt = 1; $attempt <= self::ICY_MAX_ATTEMPTS; $attempt++) {
-            try {
-                // Connexion neuve à chaque tentative (CURLOPT Connection: close).
-                $meta = $this->readIcyStreamTitle($this->streamUrl);
-            } catch (NrjClientError $e) {
-                $this->logger?->warning('ICY : ' . $e->getMessage());
-                return ['song' => null, 'ad_banner' => false];
-            }
-            if ($meta === null) {
-                return ['song' => null, 'ad_banner' => false];
-            }
-            $lastMeta = $meta['raw'];
+        $empty = [
+            'song'           => null,
+            'ad_banner'      => false,
+            'junk'           => false,
+            'ad_duration_ms' => 0,
+        ];
 
-            // Bannière Adswizz : StreamTitle vide + adw_ad pendant que la musique joue.
-            // Ne PAS attendre — le cron doit basculer sur radio-api / miroir.
-            if (!empty($meta['is_ad'])) {
-                $this->logger?->info(
-                    'ICY méta pub : ' . substr($lastMeta, 0, 100)
-                );
-                return ['song' => null, 'ad_banner' => true];
-            }
+        try {
+            // Connexion neuve (CURLOPT Connection: close).
+            $meta = $this->readIcyStreamTitle($this->streamUrl);
+        } catch (NrjClientError $e) {
+            $this->logger?->warning('ICY : ' . $e->getMessage());
+            return $empty;
+        }
+        if ($meta === null) {
+            return $empty;
+        }
 
-            $titleRaw = trim($meta['stream_title']);
-            if ($titleRaw === '') {
-                return ['song' => null, 'ad_banner' => false];
-            }
+        $adDurationMs = (int) ($meta['ad_duration_ms'] ?? 0);
 
-            $parsed = $this->parseArtistTitle($titleRaw);
-            if ($parsed === null) {
-                $this->logger?->info('ICY StreamTitle non parsé : ' . substr($titleRaw, 0, 80));
-                return ['song' => null, 'ad_banner' => false];
-            }
-
-            [$artist, $title] = $parsed;
-            if ($this->shouldSkip($artist, $title)) {
-                return ['song' => null, 'ad_banner' => false];
-            }
-
+        // Bannière Adswizz : StreamTitle vide + adw_ad.
+        if (!empty($meta['is_ad'])) {
+            $this->logger?->info(
+                'ICY méta pub : ' . substr($meta['raw'], 0, 100)
+            );
             return [
-                'song' => new NrjSong(
-                    $this->stableSongId($artist, $title, null),
-                    $artist,
-                    $title
-                ),
-                'ad_banner' => false,
+                'song'           => null,
+                'ad_banner'      => true,
+                'junk'           => false,
+                'ad_duration_ms' => $adDurationMs,
             ];
         }
 
-        if ($lastMeta !== '') {
-            $this->logger?->info('Dernière méta ICY : ' . substr($lastMeta, 0, 120));
+        $titleRaw = trim($meta['stream_title']);
+        if ($titleRaw === '') {
+            return $empty;
         }
-        return ['song' => null, 'ad_banner' => false];
+
+        // Promo brute sans séparateur artiste/titre (ex. « NRJ EURO HOT 30 »).
+        if (self::isJunk('NRJ', $titleRaw) || self::isJunk($titleRaw, $titleRaw)) {
+            $this->logger?->info(
+                'ICY StreamTitle promo : ' . substr($titleRaw, 0, 80)
+            );
+            return [
+                'song'           => null,
+                'ad_banner'      => false,
+                'junk'           => true,
+                'ad_duration_ms' => 0,
+            ];
+        }
+
+        $parsed = $this->parseArtistTitle($titleRaw);
+        if ($parsed === null) {
+            $this->logger?->info('ICY StreamTitle non parsé : ' . substr($titleRaw, 0, 80));
+            return $empty;
+        }
+
+        [$artist, $title] = $parsed;
+        if ($this->shouldSkip($artist, $title)) {
+            $this->logger?->info(
+                'ICY StreamTitle junk : ' . $artist . ' - ' . $title
+            );
+            return [
+                'song'           => null,
+                'ad_banner'      => false,
+                'junk'           => true,
+                'ad_duration_ms' => 0,
+            ];
+        }
+
+        return [
+            'song' => new NrjSong(
+                $this->stableSongId($artist, $title, null),
+                $artist,
+                $title
+            ),
+            'ad_banner'      => false,
+            'junk'           => false,
+            'ad_duration_ms' => 0,
+        ];
     }
 
     /**
-     * @return array{stream_title:string,is_ad:bool,raw:string}|null
+     * @return array{stream_title:string,is_ad:bool,raw:string,ad_duration_ms:int}|null
      */
     private function readIcyStreamTitle(string $url): ?array
     {
@@ -464,7 +630,7 @@ final class NrjClient
     }
 
     /**
-     * @return array{stream_title:string,is_ad:bool,raw:string}|null
+     * @return array{stream_title:string,is_ad:bool,raw:string,ad_duration_ms:int}|null
      */
     private function parseIcyBuffer(string $buffer, int $metaInt): ?array
     {
@@ -499,10 +665,16 @@ final class NrjClient
                 $raw
             );
 
+            $adDurationMs = 0;
+            if (preg_match("/durationMilliseconds='(\d+)'/i", $raw, $dm)) {
+                $adDurationMs = (int) $dm[1];
+            }
+
             $candidate = [
-                'stream_title' => trim($streamTitle),
-                'is_ad'        => $isAd,
-                'raw'          => $raw,
+                'stream_title'   => trim($streamTitle),
+                'is_ad'          => $isAd,
+                'raw'            => $raw,
+                'ad_duration_ms' => $adDurationMs,
             ];
 
             if ($isAd || $candidate['stream_title'] === '') {
