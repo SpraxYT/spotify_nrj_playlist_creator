@@ -2,7 +2,7 @@
 
 Ajoute automatiquement à une playlist Spotify les titres diffusés sur NRJ.
 
-Le script lit le titrage NRJ (API JSON officielle pour le titre en cours ; historique via miroir / page [chansons-diffusees](https://www.nrj.fr/chansons-diffusees)), cherche chaque morceau sur Spotify et l’ajoute sans doublon. Conçu pour PHP + cron (aaPanel ou équivalent). La page HTML officielle est souvent bloquée par Cloudflare depuis une IP datacenter — le client bascule alors sur un miroir ou l’API.
+Le titre en cours est lu via les **métadonnées ICY** du flux `streaming.nrjaudio.fm` (hors Cloudflare), avec repli sur `radio-api.net` puis `www.nrj.fr` en dernier recours. Conçu pour PHP + cron (aaPanel / VPS) : les pages `nrj.fr` sont souvent en **403 Cloudflare** depuis une IP datacenter.
 
 ## Prérequis
 
@@ -26,21 +26,20 @@ Renseignez `config.php` (ne le committez jamais) :
 |---|---|
 | `SPOTIFY_*` | Identifiants app + Redirect URI + ID playlist |
 | `NRJ_WEBRADIO_ID` | `158` = NRJ FM, `1` = NRJ HITS |
-| `CRON_SECRET` | Secret pour `run.php` et la page historique |
+| `NRJ_STREAM_URL` | Optionnel — URL du flux ICY (défaut selon webradio) |
+| `CRON_SECRET` | Secret pour `run.php` et la page historique (**à régénérer s’il a fuité**) |
 
 ## Autorisation (une fois)
 
-Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json` (chemin absolu sous la racine du projet). Le consentement est forcé (`show_dialog=true`).
-
-Si une ré-autorisation n’écrit pas de `refresh_token`, révoquez l’app sur [spotify.com/account/apps](https://www.spotify.com/account/apps/) puis rouvrez `auth.php`. En cas de ré-auth sans nouveau refresh, l’ancien token déjà présent dans `token.json` est conservé.
+Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json`.
 
 ## Utilisation
 
 ```bash
-# Titre en cours (cron)
+# Titre en cours (cron) — source ICY, enregistre aussi data/nrj_history.json
 php run.php
 
-# Import historique (CLI)
+# Import depuis l’historique local
 php run.php --backfill
 ```
 
@@ -50,20 +49,20 @@ HTTP :
 curl "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET"
 ```
 
-### Page historique (manuel)
+### Historique (manuel)
 
-Ouvrez `history.php`, saisissez `CRON_SECRET`, cliquez sur **Récupérer l’historique NRJ**, puis **Ajouter à la playlist Spotify**.
+Ouvrez `history.php` : liste l’historique **local** construit par le cron, permet de capturer le titre en cours et d’ajouter le lot à Spotify.
 
-L’accueil `index.php` regroupe les liens (auth, historique, run).
+Sur un VPS, l’historique distant `chansons-diffusees` est en général inaccessible (Cloudflare). Plus le cron tourne souvent (ex. chaque minute), plus l’historique local se remplit.
 
-Logs : stdout + `data/run.log`. Cache : `data/cache.json`.
+Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `data/nrj_history.json`.
 
 ## Fichiers
 
 | Fichier | Rôle |
 |---|---|
 | `run.php` | Cron / titre en cours / `--backfill` |
-| `history.php` | UI web historique → playlist |
+| `history.php` | UI historique local → playlist |
 | `auth.php` | OAuth Spotify |
 | `index.php` | Accueil |
 | `src/` | Clients NRJ / Spotify, cache, HTTP |

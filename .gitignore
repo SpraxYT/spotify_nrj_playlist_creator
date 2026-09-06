@@ -6,6 +6,7 @@ config.php
 data/token.json
 data/cache.json
 data/seen_tracks.json
+data/nrj_history.json
 data/run.log
 
 # Python (legacy)

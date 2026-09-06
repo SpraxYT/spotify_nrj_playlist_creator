@@ -47,7 +47,9 @@ if ($isCli) {
 
 $logger = new Logger($root . '/data/run.log', true);
 $cache = new Cache($root . '/data/cache.json');
+$history = new NrjHistoryStore($root . '/data/nrj_history.json');
 $webradioId = $config->string('NRJ_WEBRADIO_ID') ?: '158';
+$streamUrl = $config->string('NRJ_STREAM_URL') ?: null;
 
 try {
     $spotify = new SpotifyClient(
@@ -60,12 +62,12 @@ try {
         $logger,
     );
 
-    $nrj = new NrjClient($webradioId, $logger);
+    $nrj = new NrjClient($webradioId, $logger, $streamUrl);
 
     if ($backfill) {
-        run_backfill($nrj, $spotify, $logger);
+        run_backfill($nrj, $spotify, $history, $logger);
     } else {
-        process_once($nrj, $spotify, $logger);
+        process_once($nrj, $spotify, $history, $logger);
     }
 
     echo "OK\n";
@@ -86,12 +88,20 @@ try {
     exit(1);
 }
 
-function process_once(NrjClient $nrj, SpotifyClient $spotify, Logger $logger): void
-{
+function process_once(
+    NrjClient $nrj,
+    SpotifyClient $spotify,
+    NrjHistoryStore $history,
+    Logger $logger
+): void {
     $song = $nrj->fetchCurrentSong();
     if ($song === null) {
         $logger->info('Aucun titre valide en cours (pub / pause).');
         return;
+    }
+
+    if ($history->remember($song)) {
+        $logger->info('Historique local : nouveau titre enregistré (' . $history->count() . ').');
     }
 
     if ($spotify->hasSeenNrjSong($song->songId)) {
@@ -104,10 +114,38 @@ function process_once(NrjClient $nrj, SpotifyClient $spotify, Logger $logger): v
     $logger->info('Résultat : ' . $status);
 }
 
-function run_backfill(NrjClient $nrj, SpotifyClient $spotify, Logger $logger): void
-{
-    $songs = $nrj->fetchRecentSongs();
-    $logger->info('Backfill — ' . count($songs) . ' titre(s) unique(s) dans l’historique NRJ.');
+function run_backfill(
+    NrjClient $nrj,
+    SpotifyClient $spotify,
+    NrjHistoryStore $history,
+    Logger $logger
+): void {
+    // Préférer l’historique local (construit par le cron hors Cloudflare).
+    $songs = $history->songs();
+    if ($songs === []) {
+        $logger->info('Historique local vide — tentative distant / titre en cours…');
+        try {
+            $songs = $nrj->fetchRecentSongs();
+            foreach (array_reverse($songs) as $song) {
+                $history->remember($song);
+            }
+            $songs = $history->songs();
+        } catch (NrjClientError $e) {
+            $logger->warning($e->getMessage());
+            $current = $nrj->fetchCurrentSong();
+            if ($current !== null) {
+                $history->remember($current);
+                $songs = [$current];
+            }
+        }
+    }
+
+    if ($songs === []) {
+        $logger->info('Backfill : aucun titre à traiter.');
+        return;
+    }
+
+    $logger->info('Backfill — ' . count($songs) . ' titre(s) dans l’historique local.');
 
     $pending = array_reverse($songs);
     $counts = ['added' => 0, 'already' => 0, 'not_found' => 0, 'skipped' => 0];

@@ -15,5 +15,6 @@ require_once $ROOT . '/src/Logger.php';
 require_once $ROOT . '/src/Cache.php';
 require_once $ROOT . '/src/Http.php';
 require_once $ROOT . '/src/NrjClient.php';
+require_once $ROOT . '/src/NrjHistoryStore.php';
 require_once $ROOT . '/src/SpotifyClient.php';
 require_once $ROOT . '/src/WebAuth.php';

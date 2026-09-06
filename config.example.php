@@ -18,6 +18,12 @@ return [
     // Webradio NRJ : 158 = NRJ FM, 1 = NRJ HITS
     'NRJ_WEBRADIO_ID'       => '158',
 
+    // Flux audio pour métadonnées ICY (hors Cloudflare). Laisser vide = défaut selon webradio.
+    // 158 : https://streaming.nrjaudio.fm/oumvmk8fnozc
+    // 1   : https://streaming.nrjaudio.fm/ouuk8j5n3nje
+    'NRJ_STREAM_URL'        => '',
+
     // Secret pour protéger l'accès web à run.php (?key=...)
+    // Si ce secret a fuité (chat, ticket…), régénérez-le immédiatement.
     'CRON_SECRET'           => 'changez_moi_par_un_secret_long',
 ];

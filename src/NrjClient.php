@@ -22,31 +22,99 @@ final class NrjClientError extends RuntimeException
 }
 
 /**
- * Récupère le titrage NRJ.
+ * Titrage NRJ sans dépendre de www.nrj.fr (souvent bloqué Cloudflare depuis un VPS).
  *
- * - Titre en cours : API JSON officielle (passe Cloudflare depuis un VPS).
- * - Historique : miroir HTML sans CF, sinon page officielle, sinon file d’attente API.
+ * Ordre pour le titre en cours :
+ * 1. Métadonnées ICY du flux streaming.nrjaudio.fm
+ * 2. API radio.net (prod.radio-api.net) — JSON hors CF
+ * 3. www.nrj.fr API / HTML — dernier recours uniquement
  */
 final class NrjClient
 {
     private const API_URL = 'https://www.nrj.fr/api/webradios/get-by-ids';
     private const HISTORY_URL = 'https://www.nrj.fr/chansons-diffusees';
-    /** Miroir des titres diffusés NRJ (pas derrière le challenge CF de nrj.fr). */
-    private const MIRROR_HISTORY_URL = 'https://myradioenligne.fr/nrj/playlist';
-    private const TIMEOUT = 15;
+    private const RADIO_API_NOW =
+        'https://prod.radio-api.net/stations/now-playing?stationIds=nrjfrance';
+    private const TIMEOUT = 12;
+    private const ICY_TIMEOUT = 10;
+    private const ICY_MAX_BLOCKS = 12;
+    private const ICY_MAX_ATTEMPTS = 3;
+
+    /** Flux MP3 connus (hors Cloudflare). */
+    private const STREAM_URLS = [
+        '158' => 'https://streaming.nrjaudio.fm/oumvmk8fnozc',
+        '1'   => 'https://streaming.nrjaudio.fm/ouuk8j5n3nje',
+    ];
 
     private const USER_AGENT =
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         . '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
+    private string $streamUrl;
+
     public function __construct(
         private readonly string $webradioId = '158',
         private readonly ?Logger $logger = null,
+        ?string $streamUrl = null,
     ) {
+        $this->streamUrl = $streamUrl
+            ?: (self::STREAM_URLS[$this->webradioId] ?? self::STREAM_URLS['158']);
     }
 
     /**
-     * Historique récent — priorise les sources qui ne passent pas par le challenge CF.
+     * Titre en cours — priorise ICY / radio-api (pas de CF).
+     */
+    public function fetchCurrentSong(): ?NrjSong
+    {
+        $errors = [];
+
+        try {
+            $song = $this->fetchCurrentFromIcy();
+            if ($song !== null) {
+                $this->logger?->info('Titre via ICY stream : ' . $song->display());
+                return $song;
+            }
+            $errors[] = 'ICY : aucun titre (pub / métadonnée vide)';
+        } catch (NrjClientError $e) {
+            $errors[] = 'ICY : ' . $e->getMessage();
+            $this->logger?->warning('ICY indisponible : ' . $e->getMessage());
+        }
+
+        try {
+            $song = $this->fetchCurrentFromRadioApi();
+            if ($song !== null) {
+                $this->logger?->info('Titre via radio-api.net : ' . $song->display());
+                return $song;
+            }
+            $errors[] = 'radio-api : aucun titre valide';
+        } catch (NrjClientError $e) {
+            $errors[] = 'radio-api : ' . $e->getMessage();
+            $this->logger?->warning('radio-api indisponible : ' . $e->getMessage());
+        }
+
+        try {
+            $song = $this->fetchCurrentFromNrjApi();
+            if ($song !== null) {
+                $this->logger?->info('Titre via API nrj.fr : ' . $song->display());
+                return $song;
+            }
+            $errors[] = 'nrj.fr API : aucun titre valide';
+        } catch (NrjClientError $e) {
+            $errors[] = 'nrj.fr API : ' . $e->getMessage();
+            $this->logger?->warning(
+                'API nrj.fr indisponible (souvent Cloudflare VPS) : ' . $e->getMessage()
+            );
+        }
+
+        $this->logger?->info(
+            'Aucun titre NRJ valide en cours. ' . implode(' | ', $errors)
+        );
+        return null;
+    }
+
+    /**
+     * Historique distant (souvent impossible depuis un VPS).
+     * Préférer NrjHistoryStore + cron. Conservé pour backfill IP résidentielle.
      *
      * @return list<NrjSong>
      */
@@ -54,113 +122,332 @@ final class NrjClient
     {
         $errors = [];
 
-        // 1) Miroir (fonctionne depuis IP datacenter)
-        try {
-            $songs = $this->fetchRecentFromMirror();
-            if ($songs !== []) {
-                $this->logger?->info(
-                    'Historique NRJ via miroir (' . count($songs) . ' titre(s)).'
-                );
-                return $songs;
-            }
-            $errors[] = 'miroir : aucun titre parsé';
-        } catch (NrjClientError $e) {
-            $errors[] = 'miroir : ' . $e->getMessage();
-            $this->logger?->warning('Historique miroir indisponible : ' . $e->getMessage());
-        }
-
-        // 2) Page officielle (souvent bloquée CF depuis un VPS)
         try {
             $songs = $this->fetchRecentFromOfficialHtml();
             if ($songs !== []) {
-                $this->logger?->info(
-                    'Historique NRJ via chansons-diffusees (' . count($songs) . ' titre(s)).'
-                );
                 return $songs;
             }
-            $errors[] = 'chansons-diffusees : aucun titre parsé';
+            $errors[] = 'chansons-diffusees : vide';
         } catch (NrjClientError $e) {
             $errors[] = 'chansons-diffusees : ' . $e->getMessage();
-            $this->logger?->warning(
-                'Historique HTML NRJ indisponible : ' . $e->getMessage()
-            );
         }
 
-        // 3) File d’attente API (quelques titres à venir / en cours — JSON officiel)
         try {
             $songs = $this->fetchPlaylistFromApi();
             if ($songs !== []) {
-                $this->logger?->info(
-                    'Historique partiel via API webradio (' . count($songs) . ' titre(s)).'
-                );
                 return $songs;
             }
-            $errors[] = 'API webradio : aucun titre valide';
+            $errors[] = 'API playlist : vide';
         } catch (NrjClientError $e) {
-            $errors[] = 'API webradio : ' . $e->getMessage();
+            $errors[] = 'API playlist : ' . $e->getMessage();
+        }
+
+        $current = $this->fetchCurrentSong();
+        if ($current !== null) {
+            return [$current];
         }
 
         throw new NrjClientError(
-            'Impossible de récupérer l’historique NRJ. '
-            . implode(' | ', $errors)
-            . ' Astuce : le cron run.php (API JSON) capture le titre en cours ; '
-            . 'l’historique complet peut aussi être lancé depuis une IP résidentielle.'
+            'Historique distant NRJ inaccessible depuis ce serveur '
+            . '(Cloudflare bloque souvent www.nrj.fr). '
+            . 'L’historique se construit localement à chaque passage du cron '
+            . '(fichier data/nrj_history.json). Détails : ' . implode(' | ', $errors)
         );
     }
 
-    /**
-     * Titre en cours : API webradio d’abord (fiable depuis VPS), puis historique.
-     */
-    public function fetchCurrentSong(): ?NrjSong
+    private function fetchCurrentFromIcy(): ?NrjSong
     {
-        try {
-            $fromApi = $this->fetchCurrentFromApi();
-            if ($fromApi !== null) {
-                return $fromApi;
+        $lastMeta = '';
+        for ($attempt = 1; $attempt <= self::ICY_MAX_ATTEMPTS; $attempt++) {
+            $meta = $this->readIcyStreamTitle($this->streamUrl);
+            if ($meta === null) {
+                continue;
             }
-        } catch (NrjClientError $e) {
-            $this->logger?->warning(
-                'API webradio indisponible (' . $e->getMessage() . ') — fallback historique.'
+            $lastMeta = $meta['raw'];
+
+            if (!empty($meta['is_ad'])) {
+                $this->logger?->info('ICY : publicité / preroll détecté, nouvel essai…');
+                usleep(400000);
+                continue;
+            }
+
+            $titleRaw = trim($meta['stream_title']);
+            if ($titleRaw === '') {
+                usleep(300000);
+                continue;
+            }
+
+            $parsed = $this->parseArtistTitle($titleRaw);
+            if ($parsed === null) {
+                continue;
+            }
+
+            [$artist, $title] = $parsed;
+            if ($this->shouldSkip($artist, $title)) {
+                return null;
+            }
+
+            return new NrjSong(
+                $this->stableSongId($artist, $title, null),
+                $artist,
+                $title
             );
         }
 
-        try {
-            $recent = $this->fetchRecentSongs();
-            return $recent[0] ?? null;
-        } catch (NrjClientError $e) {
-            $this->logger?->warning(
-                'Historique indisponible pour le titre en cours : ' . $e->getMessage()
-            );
-            return null;
+        if ($lastMeta !== '') {
+            $this->logger?->info('Dernière méta ICY : ' . substr($lastMeta, 0, 120));
         }
+        return null;
     }
 
     /**
-     * @return list<NrjSong>
+     * @return array{stream_title:string,is_ad:bool,raw:string}|null
      */
-    private function fetchRecentFromMirror(): array
+    private function readIcyStreamTitle(string $url): ?array
     {
-        $html = $this->httpGet(
-            self::MIRROR_HISTORY_URL,
-            'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-            'https://myradioenligne.fr/'
-        );
+        $payload = function_exists('curl_init')
+            ? $this->readIcyBufferCurl($url)
+            : $this->readIcyBufferStream($url);
 
-        return $this->parseMirrorHtml($html);
+        return $this->parseIcyBuffer($payload['buffer'], $payload['meta_int']);
     }
 
     /**
-     * @return list<NrjSong>
+     * @return array{buffer:string,meta_int:int}
      */
-    private function fetchRecentFromOfficialHtml(): array
+    private function readIcyBufferCurl(string $url): array
     {
-        $url = self::HISTORY_URL . '?' . http_build_query([
-            'webradio' => $this->webradioId,
-            '_'        => (string) time(),
+        $ch = curl_init($url);
+        if ($ch === false) {
+            throw new NrjClientError('Impossible d’ouvrir le flux ICY');
+        }
+
+        $buffer = '';
+        $metaInt = 0;
+
+        curl_setopt_array($ch, [
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => self::ICY_TIMEOUT,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_USERAGENT      => self::USER_AGENT,
+            CURLOPT_HTTPHEADER     => [
+                'Icy-MetaData: 1',
+                'Accept: */*',
+                'Connection: close',
+            ],
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$metaInt): int {
+                if (preg_match('/^icy-metaint:\s*(\d+)/i', $line, $m)) {
+                    $metaInt = (int) $m[1];
+                }
+                return strlen($line);
+            },
+            CURLOPT_WRITEFUNCTION  => static function ($ch, string $data) use (&$buffer, &$metaInt): int {
+                $buffer .= $data;
+                $need = ($metaInt > 0 ? $metaInt : 16000) * 4 + 4096;
+                if (strlen($buffer) >= $need) {
+                    return 0;
+                }
+                return strlen($data);
+            },
         ]);
 
-        $html = $this->httpGet($url, 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8');
-        return $this->parseHistoryHtml($html);
+        curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        // CURLE_WRITE_ERROR (23) attendu quand on coupe le flux volontairement
+        if ($errno !== 0 && $errno !== 23 && $buffer === '') {
+            throw new NrjClientError('Échec lecture flux ICY : ' . $err);
+        }
+        if ($metaInt <= 0) {
+            throw new NrjClientError('Flux sans icy-metaint (métadonnées absentes)');
+        }
+
+        return ['buffer' => $buffer, 'meta_int' => $metaInt];
+    }
+
+    /**
+     * Fallback sans extension cURL (fopen / sockets).
+     *
+     * @return array{buffer:string,meta_int:int}
+     */
+    private function readIcyBufferStream(string $url): array
+    {
+        $parts = parse_url($url);
+        if ($parts === false || empty($parts['host'])) {
+            throw new NrjClientError('URL de flux ICY invalide');
+        }
+
+        $scheme = $parts['scheme'] ?? 'https';
+        $host = $parts['host'];
+        $port = (int) ($parts['port'] ?? ($scheme === 'https' ? 443 : 80));
+        $path = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+        $remote = ($scheme === 'https' ? 'ssl://' : '') . $host . ':' . $port;
+
+        $fp = @stream_socket_client(
+            $remote,
+            $errno,
+            $errstr,
+            5,
+            STREAM_CLIENT_CONNECT
+        );
+        if ($fp === false) {
+            throw new NrjClientError('Connexion flux ICY impossible : ' . $errstr);
+        }
+
+        stream_set_timeout($fp, self::ICY_TIMEOUT);
+        $req = "GET {$path} HTTP/1.0\r\n"
+            . "Host: {$host}\r\n"
+            . 'User-Agent: ' . self::USER_AGENT . "\r\n"
+            . "Icy-MetaData: 1\r\n"
+            . "Accept: */*\r\n"
+            . "Connection: close\r\n\r\n";
+        fwrite($fp, $req);
+
+        $headers = '';
+        while (!feof($fp)) {
+            $line = fgets($fp, 2048);
+            if ($line === false) {
+                break;
+            }
+            $headers .= $line;
+            if ($line === "\r\n" || $line === "\n") {
+                break;
+            }
+        }
+
+        $metaInt = 0;
+        if (preg_match('/icy-metaint:\s*(\d+)/i', $headers, $m)) {
+            $metaInt = (int) $m[1];
+        }
+        if ($metaInt <= 0) {
+            fclose($fp);
+            throw new NrjClientError('Flux sans icy-metaint (métadonnées absentes)');
+        }
+
+        $need = $metaInt * 4 + 4096;
+        $buffer = '';
+        while (!feof($fp) && strlen($buffer) < $need) {
+            $chunk = fread($fp, 8192);
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $buffer .= $chunk;
+        }
+        fclose($fp);
+
+        return ['buffer' => $buffer, 'meta_int' => $metaInt];
+    }
+
+    /**
+     * @return array{stream_title:string,is_ad:bool,raw:string}|null
+     */
+    private function parseIcyBuffer(string $buffer, int $metaInt): ?array
+    {
+        $offset = 0;
+        $len = strlen($buffer);
+        $lastAd = null;
+
+        for ($i = 0; $i < self::ICY_MAX_BLOCKS && ($offset + $metaInt) <= $len; $i++) {
+            $offset += $metaInt;
+            if ($offset >= $len) {
+                break;
+            }
+            $lengthByte = ord($buffer[$offset]);
+            $offset++;
+            $metaLen = $lengthByte * 16;
+            if ($metaLen <= 0) {
+                continue;
+            }
+            if ($offset + $metaLen > $len) {
+                break;
+            }
+            $raw = rtrim(substr($buffer, $offset, $metaLen), "\0");
+            $offset += $metaLen;
+            if ($raw === '') {
+                continue;
+            }
+
+            $streamTitle = '';
+            if (preg_match("/StreamTitle='([^']*)'/", $raw, $m)) {
+                $streamTitle = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            } elseif (preg_match('/StreamTitle="([^"]*)"/', $raw, $m)) {
+                $streamTitle = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            }
+
+            $isAd = (bool) preg_match(
+                "/adw_ad='true'|insertionType='(?:preroll|midroll|ad)'/i",
+                $raw
+            );
+
+            $candidate = [
+                'stream_title' => trim($streamTitle),
+                'is_ad'        => $isAd,
+                'raw'          => $raw,
+            ];
+
+            if ($isAd || $candidate['stream_title'] === '') {
+                $lastAd = $candidate;
+                continue;
+            }
+
+            return $candidate;
+        }
+
+        return $lastAd;
+    }
+
+    private function fetchCurrentFromRadioApi(): ?NrjSong
+    {
+        $body = $this->httpGet(
+            self::RADIO_API_NOW,
+            'application/json',
+            'https://www.radio.net/',
+            'https://www.radio.net'
+        );
+        $data = json_decode($body, true);
+        if (!is_array($data) || $data === []) {
+            return null;
+        }
+
+        $row = $data[0] ?? null;
+        if (!is_array($row)) {
+            return null;
+        }
+
+        $combined = trim((string) ($row['title'] ?? ''));
+        if ($combined === '') {
+            return null;
+        }
+
+        $parsed = $this->parseArtistTitle($combined);
+        if ($parsed === null) {
+            return null;
+        }
+
+        [$artist, $title] = $parsed;
+        if ($this->shouldSkip($artist, $title)) {
+            return null;
+        }
+
+        return new NrjSong($this->stableSongId($artist, $title, null), $artist, $title);
+    }
+
+    private function fetchCurrentFromNrjApi(): ?NrjSong
+    {
+        $station = $this->fetchStationPayload();
+        $playlist = $station['playlist'] ?? [];
+        if (!is_array($playlist) || $playlist === []) {
+            return null;
+        }
+
+        $entry = $playlist[0];
+        if (!is_array($entry)) {
+            return null;
+        }
+
+        return $this->songFromApiEntry($entry, true);
     }
 
     /**
@@ -175,44 +462,32 @@ final class NrjClient
         }
 
         $songs = [];
-        $seenIds = [];
+        $seen = [];
         foreach ($playlist as $entry) {
             if (!is_array($entry)) {
                 continue;
             }
             $song = $this->songFromApiEntry($entry, false);
-            if ($song === null || isset($seenIds[$song->songId])) {
+            if ($song === null || isset($seen[$song->songId])) {
                 continue;
             }
-            $seenIds[$song->songId] = true;
+            $seen[$song->songId] = true;
             $songs[] = $song;
         }
-
         return $songs;
     }
 
-    private function fetchCurrentFromApi(): ?NrjSong
+    /**
+     * @return list<NrjSong>
+     */
+    private function fetchRecentFromOfficialHtml(): array
     {
-        $station = $this->fetchStationPayload();
-        $playlist = $station['playlist'] ?? [];
-        if (!is_array($playlist) || $playlist === []) {
-            return null;
-        }
-
-        $entry = $playlist[0];
-        if (!is_array($entry)) {
-            return null;
-        }
-
-        $endTs = $entry['end_timestamp'] ?? null;
-        if (is_numeric($endTs) && (float) $endTs < time() - 30) {
-            $this->logger?->info(
-                sprintf('API webradio périmée (end_timestamp=%.0f), ignorée.', (float) $endTs)
-            );
-            return null;
-        }
-
-        return $this->songFromApiEntry($entry, true);
+        $url = self::HISTORY_URL . '?' . http_build_query([
+            'webradio' => $this->webradioId,
+            '_'        => (string) time(),
+        ]);
+        $html = $this->httpGet($url, 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8');
+        return $this->parseHistoryHtml($html);
     }
 
     /**
@@ -221,21 +496,17 @@ final class NrjClient
     private function fetchStationPayload(): array
     {
         $url = self::API_URL . '?ids[]=' . rawurlencode($this->webradioId);
-
         $body = $this->httpGet($url, 'application/json,text/plain,*/*;q=0.8');
         $data = json_decode($body, true);
         if (!is_array($data)) {
             throw new NrjClientError('Réponse NRJ API non JSON');
         }
-
         $station = $data[$this->webradioId] ?? null;
         if (!is_array($station)) {
             throw new NrjClientError(
-                'Webradio ' . $this->webradioId . ' absente de la réponse : '
-                . implode(', ', array_map('strval', array_keys($data)))
+                'Webradio ' . $this->webradioId . ' absente de la réponse'
             );
         }
-
         return $station;
     }
 
@@ -247,6 +518,9 @@ final class NrjClient
         if ($respectEndTimestamp) {
             $endTs = $entry['end_timestamp'] ?? null;
             if (is_numeric($endTs) && (float) $endTs < time() - 30) {
+                $this->logger?->info(
+                    sprintf('API webradio périmée (end_timestamp=%.0f), ignorée.', (float) $endTs)
+                );
                 return null;
             }
         }
@@ -277,76 +551,15 @@ final class NrjClient
     /**
      * @return list<NrjSong>
      */
-    private function parseMirrorHtml(string $html): array
-    {
-        $songs = [];
-        $seenIds = [];
-
-        if (!preg_match_all(
-            '/data-youtube="([^"]*)"[^>]*>.*?<span itemprop="byArtist">\s*([^<]+?)\s*<\/span>'
-            . '\s*-\s*<span itemprop="name">\s*([^<]+?)\s*<\/span>/s',
-            $html,
-            $matches,
-            PREG_SET_ORDER
-        )) {
-            // Variante sans data-youtube sur le même nœud
-            if (!preg_match_all(
-                '/<span itemprop="byArtist">\s*([^<]+?)\s*<\/span>\s*-\s*'
-                . '<span itemprop="name">\s*([^<]+?)\s*<\/span>/s',
-                $html,
-                $matches2,
-                PREG_SET_ORDER
-            )) {
-                return [];
-            }
-            foreach ($matches2 as $m) {
-                $artist = html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $title = html_entity_decode(trim($m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                if ($this->shouldSkip($artist, $title)) {
-                    continue;
-                }
-                $songId = $this->stableSongId($artist, $title, null);
-                if (isset($seenIds[$songId])) {
-                    continue;
-                }
-                $seenIds[$songId] = true;
-                $songs[] = new NrjSong($songId, $artist, $title);
-            }
-            return $songs;
-        }
-
-        foreach ($matches as $m) {
-            $clip = trim($m[1]);
-            $artist = html_entity_decode(trim($m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            $title = html_entity_decode(trim($m[3]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            if ($this->shouldSkip($artist, $title)) {
-                continue;
-            }
-            $songId = $this->stableSongId($artist, $title, $clip !== '' ? $clip : null);
-            if (isset($seenIds[$songId])) {
-                continue;
-            }
-            $seenIds[$songId] = true;
-            $songs[] = new NrjSong($songId, $artist, $title);
-        }
-
-        return $songs;
-    }
-
-    /**
-     * @return list<NrjSong>
-     */
     private function parseHistoryHtml(string $html): array
     {
         $blocks = preg_split('/<div class="listPlaylist-item">/', $html);
         if ($blocks === false || count($blocks) < 2) {
             return [];
         }
-
         array_shift($blocks);
         $songs = [];
         $seenIds = [];
-
         foreach ($blocks as $block) {
             if (
                 !preg_match(
@@ -358,19 +571,16 @@ final class NrjClient
             ) {
                 continue;
             }
-
             $artist = html_entity_decode(trim($artistM[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
             $title = html_entity_decode(trim($titleM[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
             if ($this->shouldSkip($artist, $title)) {
                 continue;
             }
-
             $clip = null;
             if (preg_match('/data-clip="([^"]*)"/', $block, $clipM)) {
                 $clipVal = trim($clipM[1]);
                 $clip = $clipVal !== '' ? $clipVal : null;
             }
-
             $songId = $this->stableSongId($artist, $title, $clip);
             if (isset($seenIds[$songId])) {
                 continue;
@@ -378,8 +588,29 @@ final class NrjClient
             $seenIds[$songId] = true;
             $songs[] = new NrjSong($songId, $artist, $title);
         }
-
         return $songs;
+    }
+
+    /**
+     * @return array{0:string,1:string}|null
+     */
+    private function parseArtistTitle(string $combined): ?array
+    {
+        $combined = trim($combined);
+        if ($combined === '') {
+            return null;
+        }
+
+        // Formats courants : "Artist - Title", "Artist – Title", "Artist — Title"
+        if (preg_match('/^(.+?)\s+[-–—]\s+(.+)$/u', $combined, $m)) {
+            $artist = trim($m[1]);
+            $title = trim($m[2]);
+            if ($artist !== '' && $title !== '') {
+                return [$artist, $title];
+            }
+        }
+
+        return null;
     }
 
     private function shouldSkip(string $artist, string $title): bool
@@ -396,11 +627,11 @@ final class NrjClient
             return true;
         }
 
-        // Habillage / claim on-air (API webradio 158)
         if (
             str_contains($combined, 'hit music only')
             || ($titleU === 'NRJ' && str_contains($combined, 'hit music'))
             || ($artistU === 'NRJ' && $titleU === 'NRJ')
+            || str_contains($combined, 'euro hot 30')
         ) {
             return true;
         }
@@ -419,7 +650,6 @@ final class NrjClient
         if ($clip !== null && $clip !== '') {
             return 'clip:' . $clip;
         }
-
         $digest = substr(
             sha1(str_lower(trim($artist)) . '|' . str_lower(trim($title))),
             0,
@@ -428,41 +658,39 @@ final class NrjClient
         return 'hist:' . $digest;
     }
 
-    private function httpGet(string $url, string $accept, ?string $referer = null): string
-    {
+    private function httpGet(
+        string $url,
+        string $accept,
+        ?string $referer = null,
+        ?string $origin = null
+    ): string {
         $referer ??= 'https://www.nrj.fr/';
-        $origin = 'https://www.nrj.fr';
-        if (str_contains($url, 'myradioenligne.fr')) {
-            $origin = 'https://myradioenligne.fr';
-        }
+        $origin ??= (str_contains($url, 'radio-api.net') || str_contains($url, 'radio.net'))
+            ? 'https://www.radio.net'
+            : 'https://www.nrj.fr';
 
         try {
             $res = Http::request('GET', $url, null, [
-                'Accept'                    => $accept,
-                'Accept-Language'           => 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-                'User-Agent'                => self::USER_AGENT,
-                'Referer'                   => $referer,
-                'Origin'                    => $origin,
-                'Cache-Control'             => 'no-cache',
-                'Pragma'                    => 'no-cache',
-                'Upgrade-Insecure-Requests' => '1',
+                'Accept'          => $accept,
+                'Accept-Language' => 'fr-FR,fr;q=0.9,en;q=0.8',
+                'User-Agent'      => self::USER_AGENT,
+                'Referer'         => $referer,
+                'Origin'          => $origin,
+                'Cache-Control'   => 'no-cache',
             ], self::TIMEOUT);
         } catch (Throwable $e) {
-            throw new NrjClientError('Échec HTTP NRJ : ' . $e->getMessage(), 0, $e);
+            throw new NrjClientError('Échec HTTP : ' . $e->getMessage(), 0, $e);
         }
 
-        if (Http::isCloudflareChallenge($res['status'], $res['body'], $res['headers'] ?? [])) {
+        $headers = $res['headers'] ?? [];
+        if (Http::isCloudflareChallenge($res['status'], $res['body'], $headers)) {
             throw new NrjClientError(Http::cloudflareErrorMessage($url));
         }
 
         if ($res['status'] !== 200) {
             throw new NrjClientError(
-                'HTTP ' . $res['status'] . ' NRJ : ' . substr($res['body'], 0, 200)
+                'HTTP ' . $res['status'] . ' : ' . substr($res['body'], 0, 160)
             );
-        }
-
-        if (Http::isCloudflareChallenge(200, $res['body'], $res['headers'] ?? [])) {
-            throw new NrjClientError(Http::cloudflareErrorMessage($url));
         }
 
         return $res['body'];

@@ -3,8 +3,11 @@
 declare(strict_types=1);
 
 /**
- * Page web : récupérer l’historique NRJ et l’ajouter à la playlist Spotify.
+ * Page web : historique local NRJ → playlist Spotify.
  * Protégée par CRON_SECRET (session après saisie du secret).
+ *
+ * L’historique distant nrj.fr est souvent bloqué par Cloudflare depuis un VPS :
+ * les titres sont accumulés dans data/nrj_history.json à chaque passage du cron.
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -14,7 +17,9 @@ WebAuth::startSession();
 header('Content-Type: text/html; charset=utf-8');
 
 $error = null;
+$info = null;
 $songs = null;
+$current = null;
 /** @var array{added:int,already:int,not_found:int,skipped:int}|null $result */
 $result = null;
 $details = [];
@@ -28,6 +33,7 @@ try {
 }
 
 $secret = $config->string('CRON_SECRET');
+$historyStore = new NrjHistoryStore(__DIR__ . '/data/nrj_history.json');
 
 if (isset($_POST['logout'])) {
     WebAuth::logout();
@@ -45,23 +51,31 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $action = (string) ($_POST['action'] ?? '');
 
     try {
-        if ($action === 'fetch' || $action === 'add') {
-            $nrj = new NrjClient($config->string('NRJ_WEBRADIO_ID') ?: '158');
-            $songs = $nrj->fetchRecentSongs();
-            $_SESSION['nrj_history_songs'] = array_map(
-                static fn(NrjSong $s): array => [
-                    'song_id' => $s->songId,
-                    'artist'  => $s->artist,
-                    'title'   => $s->title,
-                ],
-                $songs
-            );
+        $nrj = new NrjClient(
+            $config->string('NRJ_WEBRADIO_ID') ?: '158',
+            null,
+            $config->string('NRJ_STREAM_URL') ?: null,
+        );
+
+        if ($action === 'poll_current') {
+            $current = $nrj->fetchCurrentSong();
+            if ($current === null) {
+                $info = 'Aucun titre musical en cours (pub, jingle ou métadonnée vide). Réessayez dans quelques secondes.';
+            } else {
+                if ($historyStore->remember($current)) {
+                    $info = 'Titre en cours enregistré dans l’historique local : ' . $current->display();
+                } else {
+                    $info = 'Titre en cours déjà en tête de l’historique : ' . $current->display();
+                }
+            }
         }
 
         if ($action === 'add') {
-            $cached = $_SESSION['nrj_history_songs'] ?? null;
-            if (!is_array($cached) || $cached === []) {
-                throw new RuntimeException('Aucun historique en session. Récupérez d’abord la liste.');
+            $songsList = $historyStore->songs();
+            if ($songsList === []) {
+                throw new RuntimeException(
+                    'Historique local vide. Lancez le cron run.php ou cliquez « Capturer le titre en cours ».'
+                );
             }
 
             $logger = new Logger(__DIR__ . '/data/run.log', false);
@@ -76,27 +90,17 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $logger,
             );
 
-            $pending = array_reverse($cached);
+            $pending = array_reverse($songsList);
             $counts = ['added' => 0, 'already' => 0, 'not_found' => 0, 'skipped' => 0];
 
-            foreach ($pending as $row) {
-                if (!is_array($row)) {
-                    continue;
-                }
-                $songId = (string) ($row['song_id'] ?? '');
-                $artist = (string) ($row['artist'] ?? '');
-                $title = (string) ($row['title'] ?? '');
-                if ($songId === '') {
-                    continue;
-                }
-
-                if ($spotify->hasSeenNrjSong($songId)) {
+            foreach ($pending as $song) {
+                if ($spotify->hasSeenNrjSong($song->songId)) {
                     $counts['skipped']++;
-                    $details[] = ['label' => $artist . ' – ' . $title, 'status' => 'déjà traité'];
+                    $details[] = ['label' => $song->display(), 'status' => 'déjà traité'];
                     continue;
                 }
 
-                $status = $spotify->addTrack($songId, $artist, $title);
+                $status = $spotify->addTrack($song->songId, $song->artist, $song->title);
                 $counts[$status] = ($counts[$status] ?? 0) + 1;
                 $label = match ($status) {
                     'added'     => 'ajouté',
@@ -104,40 +108,19 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     'not_found' => 'introuvable',
                     default     => $status,
                 };
-                $details[] = ['label' => $artist . ' – ' . $title, 'status' => $label];
+                $details[] = ['label' => $song->display(), 'status' => $label];
                 usleep(350000);
             }
 
             $result = $counts;
-            $songs = [];
-            foreach ($cached as $row) {
-                if (!is_array($row)) {
-                    continue;
-                }
-                $songs[] = new NrjSong(
-                    (string) ($row['song_id'] ?? ''),
-                    (string) ($row['artist'] ?? ''),
-                    (string) ($row['title'] ?? ''),
-                );
-            }
         }
     } catch (Throwable $e) {
         $error = $e->getMessage();
     }
 }
 
-if ($authed && $songs === null && isset($_SESSION['nrj_history_songs']) && is_array($_SESSION['nrj_history_songs'])) {
-    $songs = [];
-    foreach ($_SESSION['nrj_history_songs'] as $row) {
-        if (!is_array($row)) {
-            continue;
-        }
-        $songs[] = new NrjSong(
-            (string) ($row['song_id'] ?? ''),
-            (string) ($row['artist'] ?? ''),
-            (string) ($row['title'] ?? ''),
-        );
-    }
+if ($authed) {
+    $songs = $historyStore->songs();
 }
 
 ob_start();
@@ -159,8 +142,13 @@ if (!$authed) {
         <h1>Historique NRJ</h1>
         <form method="post"><button type="submit" name="logout" value="1" class="linkish">Déconnexion</button></form>
     </div>
-    <p class="muted">Récupère les titres récents NRJ (API / miroir résistant à Cloudflare, puis <a href="https://www.nrj.fr/chansons-diffusees" rel="noopener">chansons-diffusees</a>), puis les ajoute à la playlist Spotify (sans doublons). Sur un VPS, si Cloudflare bloque encore la page officielle, le miroir ou le cron <code>run.php</code> (titre en cours) restent utilisables.</p>
+    <p class="muted">
+        L’historique distant NRJ (<code>nrj.fr</code>) est bloqué par Cloudflare depuis la plupart des VPS.
+        Les titres s’accumulent dans <code>data/nrj_history.json</code> à chaque passage du cron
+        <code>run.php</code> (métadonnées ICY du flux audio, hors Cloudflare).
+    </p>
     <?php if ($error): ?><p class="err"><?= history_h($error) ?></p><?php endif; ?>
+    <?php if ($info): ?><p class="okmsg"><?= history_h($info) ?></p><?php endif; ?>
 
     <?php if ($result !== null): ?>
         <div class="box ok">
@@ -185,12 +173,12 @@ if (!$authed) {
     <?php endif; ?>
 
     <form method="post" class="actions">
-        <input type="hidden" name="action" value="fetch">
-        <button type="submit">Récupérer l’historique NRJ</button>
+        <input type="hidden" name="action" value="poll_current">
+        <button type="submit">Capturer le titre en cours (ICY / radio-api)</button>
     </form>
 
     <?php if (is_array($songs) && $songs !== []): ?>
-        <p><strong><?= count($songs) ?></strong> titre(s) trouvé(s)</p>
+        <p><strong><?= count($songs) ?></strong> titre(s) dans l’historique local</p>
         <form method="post" class="actions">
             <input type="hidden" name="action" value="add">
             <button type="submit" class="primary">Ajouter à la playlist Spotify</button>
@@ -200,8 +188,8 @@ if (!$authed) {
                 <li><?= history_h($s->artist) ?> – <?= history_h($s->title) ?></li>
             <?php endforeach; ?>
         </ol>
-    <?php elseif (is_array($songs) && $songs === []): ?>
-        <p class="muted">Aucun titre trouvé.</p>
+    <?php else: ?>
+        <p class="muted">Aucun titre local pour l’instant. Attendez le prochain cron ou capturez le titre en cours.</p>
     <?php endif; ?>
     <?php
 }
@@ -245,6 +233,7 @@ button.linkish{border:0;background:transparent;color:var(--muted);padding:0;text
 .list em{color:var(--muted);font-style:normal;font-size:.9rem}
 .counts{margin:.5rem 0 0;padding-left:1.2rem}
 .err{color:var(--err)}
+.okmsg{color:#0b6b3a}
 code{font-size:.9em}
 a.nav{color:var(--muted);font-size:.9rem}
 </style>
