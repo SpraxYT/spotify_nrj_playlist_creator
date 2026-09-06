@@ -53,24 +53,55 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $config->string('NRJ_STREAM_URL') ?: null,
         );
 
-        if ($action === 'fetch' || $action === 'poll_current' || $action === 'add') {
-            // Toujours tenter le miroir pour rafraîchir l’historique local
+        if ($action === 'fetch' || $action === 'poll_current' || $action === 'add' || $action === 'create_playlist') {
+            // Toujours tenter le miroir pour rafraîchir l’historique local (liste complète)
             if ($action === 'fetch' || $action === 'add') {
                 try {
                     $remote = $nrj->fetchRecentSongs();
-                    foreach (array_reverse($remote) as $song) {
-                        $historyStore->remember($song);
+                    $merged = $historyStore->mergeRemote($remote);
+                    // Enrichir avec le titre ICY en cours s’il n’est pas déjà dans le miroir
+                    try {
+                        $current = $nrj->fetchCurrentSong();
+                        if ($current !== null) {
+                            $historyStore->remember($current);
+                        }
+                    } catch (Throwable) {
+                        // ICY optionnel
                     }
-                    $info = count($remote) . ' titre(s) musicaux récupérés (promos filtrées).';
+                    $info = $merged . ' titre(s) musicaux du miroir (union avec l’historique local, promos filtrées). '
+                        . 'Total affiché : ' . $historyStore->count() . '.';
                 } catch (NrjClientError $e) {
                     if ($action === 'fetch') {
                         throw $e;
                     }
-                    // add peut continuer sur l’historique local déjà présent
                     $info = 'Miroir distant indisponible — utilisation de l’historique local. '
                         . $e->getMessage();
                 }
             }
+        }
+
+        if ($action === 'create_playlist') {
+            $logger = new Logger(__DIR__ . '/data/run.log', false);
+            $cache = new Cache(__DIR__ . '/data/cache.json');
+            $spotify = new SpotifyClient(
+                $config->string('SPOTIFY_CLIENT_ID'),
+                $config->string('SPOTIFY_CLIENT_SECRET'),
+                $config->string('SPOTIFY_REDIRECT_URI'),
+                $config->string('SPOTIFY_PLAYLIST_ID'),
+                __DIR__ . '/data/token.json',
+                $cache,
+                $logger,
+                false,
+                __DIR__,
+            );
+            $created = $spotify->createPlaylist(
+                'NRJ Bot ' . gmdate('Y-m-d H:i'),
+                'Créée automatiquement par nrjbot',
+                true
+            );
+            SpotifyClient::savePlaylistIdOverride(__DIR__, $created['id'], $created['name']);
+            $info = 'Playlist créée sous votre compte : « ' . $created['name'] . ' » (id='
+                . $created['id'] . '). Enregistrée dans data/playlist_id.json.';
         }
 
         if ($action === 'poll_current') {
@@ -219,6 +250,12 @@ if (!$authed) {
         <input type="hidden" name="action" value="poll_current">
         <button type="submit">Capturer le titre en cours (ICY)</button>
     </form>
+    <form method="post" class="actions">
+        <input type="hidden" name="action" value="create_playlist">
+        <button type="submit">Créer une nouvelle playlist NRJ via l’API</button>
+    </form>
+    <p class="muted">Diagnostic : <a href="debug.php">debug.php</a>
+        (même secret) — test d’ajout d’un titre, comparaison me/owner, scopes.</p>
 
     <?php if (is_array($songs) && $songs !== []): ?>
         <p><strong><?= count($songs) ?></strong> titre(s) musicaux</p>

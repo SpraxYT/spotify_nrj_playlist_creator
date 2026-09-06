@@ -62,7 +62,8 @@ Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `d
 | Fichier | Rôle |
 |---|---|
 | `run.php` | Cron / titre en cours / `--backfill` |
-| `history.php` | UI historique local → playlist |
+| `history.php` | UI historique miroir → playlist |
+| `debug.php` | Diagnostic Spotify (me/owner/scopes/test add) |
 | `auth.php` | OAuth Spotify |
 | `index.php` | Accueil |
 | `src/` | Clients NRJ / Spotify, cache, HTTP |
@@ -73,11 +74,17 @@ Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `d
 
 Si `history.php` affiche `403 Forbidden` :
 
-1. **Development mode** — [Dashboard](https://developer.spotify.com/dashboard) → votre app → **User Management** → Add user (e-mail du compte Spotify), puis rouvrez `auth.php`.
-2. **Propriétaire de la playlist** — `SPOTIFY_PLAYLIST_ID` doit être une playlist créée par **ce même compte** (pas un autre profil). Ex. `4DCkQ853je6ajt28tF6bef`.
-3. Consultez `data/run.log` : les lignes `Spotify connecté` et `Playlist … propriétaire` comparent les IDs.
+1. **Endpoint fév. 2026** — l’ajout doit utiliser `POST /v1/playlists/{id}/items`
+   (l’ancien `/tracks` renvoie **403** en Development Mode, même si vous êtes propriétaire).
+2. **Development mode** — [Dashboard](https://developer.spotify.com/dashboard) → votre app
+   (**NRJ TUBE**) → **User Management** → Add user, puis rouvrez `auth.php`.
+3. **Propriétaire** — seulement si `me.id` ≠ `owner.id` (voir `debug.php`).
+4. Ouvrez `debug.php?key=CRON_SECRET` : compare me/owner, scopes du token, bouton
+   **Test ajout 1 titre**.
 
-Les promos / jingles (ex. « NRJ EURO HOT 30 ») sont filtrées. Le cron `run.php` synchronise jusqu’à 8 titres musicaux manquants par passage via le miroir d’historique.
+Les promos / jingles (ex. « NRJ EURO HOT 30 ») sont filtrées. Le bouton
+« Récupérer l’historique NRJ » charge le **miroir complet** (~30–40 titres), fusionné
+avec l’historique ICY/local.
 
 ## Licence
 

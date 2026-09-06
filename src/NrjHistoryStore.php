@@ -50,6 +50,64 @@ final class NrjHistoryStore
     }
 
     /**
+     * Fusionne une liste distante (ex. miroir ~30–40 titres) dans l’historique local.
+     * Les titres fournis (ordre : plus récent en premier) deviennent la tête ;
+     * les entrées locales absentes du lot sont conservées derrière (union).
+     *
+     * @param list<NrjSong> $songs
+     * @return int nombre de titres musicaux du lot fusionné (hors junk)
+     */
+    public function mergeRemote(array $songs): int
+    {
+        $incoming = [];
+        $seen = [];
+        foreach ($songs as $song) {
+            if (!$song instanceof NrjSong) {
+                continue;
+            }
+            if (NrjClient::isJunk($song->artist, $song->title)) {
+                continue;
+            }
+            $key = $this->dedupeKey($song->songId, $song->artist, $song->title);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $incoming[] = [
+                'song_id'  => $song->songId,
+                'artist'   => $song->artist,
+                'title'    => $song->title,
+                'heard_at' => gmdate('c'),
+            ];
+        }
+
+        if ($incoming === []) {
+            return 0;
+        }
+
+        $merged = $incoming;
+        foreach ($this->entries as $row) {
+            if (NrjClient::isJunk($row['artist'], $row['title'])) {
+                continue;
+            }
+            $key = $this->dedupeKey($row['song_id'], $row['artist'], $row['title']);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $merged[] = $row;
+        }
+
+        if (count($merged) > self::MAX_ENTRIES) {
+            $merged = array_slice($merged, 0, self::MAX_ENTRIES);
+        }
+
+        $this->entries = $merged;
+        $this->save();
+        return count($incoming);
+    }
+
+    /**
      * Ajoute un titre en tête s’il n’est pas déjà le plus récent.
      * Retourne true si une nouvelle entrée a été écrite.
      */
@@ -100,6 +158,11 @@ final class NrjHistoryStore
         $this->entries = $filtered;
         $this->save();
         return true;
+    }
+
+    private function dedupeKey(string $songId, string $artist, string $title): string
+    {
+        return $songId . '|' . str_lower(trim($artist)) . '|' . str_lower(trim($title));
     }
 
     private function load(): void

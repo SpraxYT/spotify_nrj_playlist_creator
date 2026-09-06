@@ -136,13 +136,15 @@ final class Http
         foreach ($headers as $k => $v) {
             $hdr[] = $k . ': ' . $v;
         }
+        // Évite Expect: 100-continue (certains reverse-proxy / WAF répondent bizarrement).
+        $hdr[] = 'Expect:';
 
         $responseHeaders = [];
+        $methodUpper = strtoupper($method);
         $opts = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_TIMEOUT        => $timeout,
-            CURLOPT_CUSTOMREQUEST  => strtoupper($method),
             CURLOPT_HTTPHEADER     => $hdr,
             CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$responseHeaders): int {
                 $len = strlen($line);
@@ -153,9 +155,22 @@ final class Http
                 return $len;
             },
         ];
+
+        if ($methodUpper === 'POST') {
+            $opts[CURLOPT_POST] = true;
+        } elseif ($methodUpper !== 'GET') {
+            $opts[CURLOPT_CUSTOMREQUEST] = $methodUpper;
+        }
+
         if ($body !== null) {
             $opts[CURLOPT_POSTFIELDS] = $body;
+            if ($methodUpper === 'GET') {
+                // Body sur GET : forcer la méthode telle quelle
+                $opts[CURLOPT_CUSTOMREQUEST] = $methodUpper;
+                unset($opts[CURLOPT_POST]);
+            }
         }
+
         curl_setopt_array($ch, $opts);
 
         $response = curl_exec($ch);

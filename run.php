@@ -112,9 +112,7 @@ function process_once(
     $batch = [];
     try {
         $remote = $nrj->fetchRecentSongs();
-        foreach (array_reverse($remote) as $song) {
-            $history->remember($song);
-        }
+        $history->mergeRemote($remote);
         $batch = $remote;
         $logger->info('Sync historique distant : ' . count($batch) . ' titre(s) musicaux.');
     } catch (NrjClientError $e) {

@@ -19,11 +19,13 @@ final class SpotifyClient
     private string $accessToken = '';
     private int $expiresAt = 0;
     private readonly string $playlistId;
+    private readonly string $rootDir;
+    private readonly bool $strictOwnership;
 
-    /** @var array{id:string,display_name:string}|null */
+    /** @var array{id:string,display_name:string,email:?string}|null */
     private ?array $me = null;
 
-    /** @var array{id:string,name:string,owner_id:string,owner_name:string}|null */
+    /** @var array{id:string,name:string,owner_id:string,owner_name:string,collaborative:bool,public:?bool}|null */
     private ?array $playlistMeta = null;
 
     public function __construct(
@@ -34,8 +36,15 @@ final class SpotifyClient
         private readonly string $tokenPath,
         private readonly Cache $cache,
         private readonly ?Logger $logger = null,
+        bool $strictOwnership = true,
+        ?string $rootDir = null,
     ) {
-        $this->playlistId = self::normalizePlaylistId($playlistId);
+        // tokenPath = …/data/token.json → root = parent of data/
+        $this->rootDir = $rootDir ?? dirname(dirname($tokenPath));
+        $this->strictOwnership = $strictOwnership;
+
+        $resolved = self::resolvePlaylistId($playlistId, $this->rootDir);
+        $this->playlistId = self::normalizePlaylistId($resolved);
         if ($this->playlistId === '') {
             throw new SpotifyClientError(
                 'SPOTIFY_PLAYLIST_ID vide. Indiquez l’ID de la playlist '
@@ -46,7 +55,111 @@ final class SpotifyClient
         $this->ensureAccessToken();
         $this->assertAuthorizedUser();
         $this->loadPlaylistMeta();
-        $this->refreshPlaylistUris();
+        if ($this->strictOwnership) {
+            $this->refreshPlaylistUris();
+        }
+    }
+
+    /**
+     * Priorité : data/playlist_id.json (créée via l’UI) puis config.
+     */
+    public static function resolvePlaylistId(string $configId, string $rootDir): string
+    {
+        $path = rtrim($rootDir, '/') . '/data/playlist_id.json';
+        if (is_file($path)) {
+            $raw = file_get_contents($path);
+            $decoded = is_string($raw) ? json_decode($raw, true) : null;
+            if (is_array($decoded)) {
+                $id = trim((string) ($decoded['id'] ?? ''));
+                if ($id !== '') {
+                    return $id;
+                }
+            }
+        }
+        return $configId;
+    }
+
+    public static function savePlaylistIdOverride(string $rootDir, string $playlistId, string $name = ''): void
+    {
+        $id = self::normalizePlaylistId($playlistId);
+        if ($id === '') {
+            throw new SpotifyClientError('ID playlist vide — impossible d’enregistrer l’override.');
+        }
+        $dir = rtrim($rootDir, '/') . '/data';
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+            throw new SpotifyClientError('Impossible de créer data/ pour playlist_id.json');
+        }
+        $payload = [
+            'id'         => $id,
+            'name'       => $name,
+            'updated_at' => gmdate('c'),
+            'source'     => 'api_create',
+        ];
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        if ($json === false || @file_put_contents($dir . '/playlist_id.json', $json . "\n", LOCK_EX) === false) {
+            throw new SpotifyClientError('Impossible d’écrire data/playlist_id.json');
+        }
+    }
+
+    public function playlistId(): string
+    {
+        return $this->playlistId;
+    }
+
+    /**
+     * @return array{id:string,display_name:string,email:?string}|null
+     */
+    public function currentUser(): ?array
+    {
+        return $this->me;
+    }
+
+    /**
+     * @return array{id:string,name:string,owner_id:string,owner_name:string,collaborative:bool,public:?bool}|null
+     */
+    public function playlistInfo(): ?array
+    {
+        return $this->playlistMeta;
+    }
+
+    public function isOwnerMatch(): ?bool
+    {
+        $meId = $this->me['id'] ?? '';
+        $ownerId = $this->playlistMeta['owner_id'] ?? '';
+        if ($meId === '' || $ownerId === '') {
+            return null;
+        }
+        return $meId === $ownerId;
+    }
+
+    /**
+     * POST /v1/me/playlists — crée une playlist sous le compte auth.php.
+     *
+     * @return array{id:string,name:string,uri:string}
+     */
+    public function createPlaylist(string $name, string $description = '', bool $public = true): array
+    {
+        $data = $this->apiRequest(
+            'POST',
+            '/me/playlists',
+            [
+                'name'        => $name,
+                'description' => $description,
+                'public'      => $public,
+            ],
+            'playlist_create'
+        );
+
+        $id = (string) ($data['id'] ?? '');
+        if ($id === '') {
+            throw new SpotifyClientError('Création playlist : réponse sans id.');
+        }
+
+        return [
+            'id'   => $id,
+            'name' => (string) ($data['name'] ?? $name),
+            'uri'  => (string) ($data['uri'] ?? ('spotify:playlist:' . $id)),
+        ];
     }
 
     public static function scopes(): string
@@ -219,9 +332,11 @@ final class SpotifyClient
             return 'already';
         }
 
+        // Fév. 2026 Dev Mode : POST /playlists/{id}/tracks → 403 Forbidden.
+        // Utiliser /items (comme spotipy 2.26 playlist_add_items).
         $this->apiRequest(
             'POST',
-            '/playlists/' . rawurlencode($this->playlistId) . '/tracks',
+            '/playlists/' . rawurlencode($this->playlistId) . '/items',
             ['uris' => [$uri]],
             'playlist_add'
         );
@@ -232,6 +347,26 @@ final class SpotifyClient
             'Ajouté avec succès : ' . $trackArtists . ' - ' . $trackName . ' (' . $uri . ')'
         );
         return 'added';
+    }
+
+    /**
+     * Ajoute un URI Spotify connu (test debug / isolation search vs add).
+     *
+     * @return array{ok:bool,status:int,body:string,url:string}
+     */
+    public function addTrackUriRaw(string $uri): array
+    {
+        $uri = trim($uri);
+        if ($uri === '' || !str_starts_with($uri, 'spotify:')) {
+            throw new SpotifyClientError('URI Spotify invalide : ' . $uri);
+        }
+
+        return $this->apiRequestRaw(
+            'POST',
+            '/playlists/' . rawurlencode($this->playlistId) . '/items',
+            ['uris' => [$uri]],
+            'playlist_add'
+        );
     }
 
     /**
@@ -311,9 +446,11 @@ final class SpotifyClient
             );
         }
 
+        $email = $res['data']['email'] ?? null;
         $this->me = [
             'id'           => (string) ($res['data']['id'] ?? ''),
             'display_name' => (string) ($res['data']['display_name'] ?? $res['data']['id'] ?? ''),
+            'email'        => is_string($email) && $email !== '' ? $email : null,
         ];
         $this->logger?->info(
             'Spotify connecté : ' . $this->me['display_name']
@@ -328,7 +465,7 @@ final class SpotifyClient
     {
         $res = $this->rawApiGet(
             '/playlists/' . rawurlencode($this->playlistId)
-            . '?fields=id,name,owner(id,display_name)'
+            . '?fields=id,name,collaborative,public,owner(id,display_name)'
         );
 
         if ($res['status'] === 401 || $res['status'] === 403) {
@@ -357,11 +494,14 @@ final class SpotifyClient
         }
 
         $owner = is_array($res['data']['owner'] ?? null) ? $res['data']['owner'] : [];
+        $public = $res['data']['public'] ?? null;
         $this->playlistMeta = [
-            'id'         => (string) ($res['data']['id'] ?? $this->playlistId),
-            'name'       => (string) ($res['data']['name'] ?? ''),
-            'owner_id'   => (string) ($owner['id'] ?? ''),
-            'owner_name' => (string) ($owner['display_name'] ?? $owner['id'] ?? ''),
+            'id'            => (string) ($res['data']['id'] ?? $this->playlistId),
+            'name'          => (string) ($res['data']['name'] ?? ''),
+            'owner_id'      => (string) ($owner['id'] ?? ''),
+            'owner_name'    => (string) ($owner['display_name'] ?? $owner['id'] ?? ''),
+            'collaborative' => (bool) ($res['data']['collaborative'] ?? false),
+            'public'        => is_bool($public) ? $public : null,
         ];
 
         $meId = $this->me['id'] ?? '';
@@ -373,15 +513,18 @@ final class SpotifyClient
         );
 
         if ($meId !== '' && $ownerId !== '' && $meId !== $ownerId) {
-            throw new SpotifyClientError(
-                'La playlist ne t’appartient pas. '
-                . 'Compte authentifié : ' . ($this->me['display_name'] ?? $meId)
+            $msg = 'La playlist ne t’appartient pas. '
+                . 'Compte authentifié (me.id) : ' . ($this->me['display_name'] ?? $meId)
                 . ' (id=' . $meId . '). '
-                . 'Propriétaire de la playlist « ' . $this->playlistMeta['name'] . ' » : '
+                . 'Propriétaire playlist (owner.id) : '
                 . $this->playlistMeta['owner_name'] . ' (id=' . $ownerId . '). '
-                . 'Crée une playlist avec le compte utilisé pour auth.php, ou mets à jour '
-                . 'SPOTIFY_PLAYLIST_ID, ou ajoute ce compte comme collaborateur.'
-            );
+                . 'Playlist id=' . $this->playlistMeta['id'] . '. '
+                . 'Crée une playlist avec le compte utilisé pour auth.php '
+                . '(bouton dans history.php / debug.php), ou mets à jour SPOTIFY_PLAYLIST_ID.';
+            if ($this->strictOwnership) {
+                throw new SpotifyClientError($msg);
+            }
+            $this->logger?->warning($msg);
         }
     }
 
@@ -397,7 +540,7 @@ final class SpotifyClient
                 $page = $this->apiRequest(
                     'GET',
                     '/playlists/' . rawurlencode($this->playlistId) . '/items?' . http_build_query([
-                        'fields'           => 'items.track.uri,next',
+                        'fields'           => 'items(track(uri),item(uri)),next',
                         'additional_types' => 'track',
                         'limit'            => $limit,
                         'offset'           => $offset,
@@ -413,7 +556,8 @@ final class SpotifyClient
                         if (!is_array($item)) {
                             continue;
                         }
-                        $uri = $item['track']['uri'] ?? null;
+                        // Avant fév. 2026 : track.uri — après : item.uri
+                        $uri = $item['track']['uri'] ?? $item['item']['uri'] ?? null;
                         if (is_string($uri) && $uri !== '') {
                             $uris[] = $uri;
                             $count++;
@@ -486,20 +630,40 @@ final class SpotifyClient
 
         $meId = $this->me['id'] ?? '';
         $ownerId = $this->playlistMeta['owner_id'] ?? '';
-        if ($meId !== '' && $ownerId !== '' && $meId !== $ownerId) {
-            return 'API Spotify HTTP 403 lors de : ' . $ctxLabel . '. '
-                . 'La playlist ne t’appartient pas. '
-                . 'Toi : ' . $meLabel . ' — propriétaire : ' . $ownerLabel
-                . ' — playlist id=' . $this->playlistId . '. '
-                . 'Utilise une playlist créée avec le compte auth.php, ou change SPOTIFY_PLAYLIST_ID. '
+        $meId = $this->me['id'] ?? '';
+        $ownerId = $this->playlistMeta['owner_id'] ?? '';
+        $meIdLabel = $meId !== '' ? $meId : '?';
+        $ownerIdLabel = $ownerId !== '' ? $ownerId : '?';
+
+        // Propriétaire OK → ne PAS accuser un mismatch : endpoint / scopes / token
+        if ($meId !== '' && $ownerId !== '' && $meId === $ownerId) {
+            return 'API Spotify HTTP 403 (Forbidden) lors de : ' . $ctxLabel . '. '
+                . 'me.id=owner.id=' . $meIdLabel . ' (' . $meLabel . ') — '
+                . 'playlist id=' . $this->playlistId . '. '
+                . 'Ce n’est pas un problème de propriétaire. Causes fréquentes : '
+                . '(1) ancien endpoint POST …/tracks (retiré fév. 2026 — il faut …/items) ; '
+                . '(2) scopes manquants dans le token — rouvrir auth.php (show_dialog) ; '
+                . '(3) Client ID config ≠ app « NRJ TUBE » du dashboard. '
+                . 'Scopes requis : ' . self::SCOPES . '. '
                 . ($spotifyMsg !== '' ? 'Détail Spotify : ' . $spotifyMsg : '');
         }
 
-        return 'API Spotify HTTP 403 lors de : ' . $ctxLabel . '. '
-            . 'Compte : ' . $meLabel . ' — playlist id=' . $this->playlistId
-            . ' (propriétaire : ' . $ownerLabel . '). '
-            . 'Tu dois être propriétaire ou collaborateur pour modifier la playlist. '
-            . 'Si l’app est en Development mode : ' . self::devModeUserManagementHint()
+        if ($meId !== '' && $ownerId !== '' && $meId !== $ownerId) {
+            return 'API Spotify HTTP 403 (Forbidden) lors de : ' . $ctxLabel . '. '
+                . 'La playlist ne t’appartient pas. '
+                . 'me.id=' . $meIdLabel . ' (' . $meLabel . ') ≠ owner.id=' . $ownerIdLabel
+                . ' (' . $ownerLabel . ') — playlist id=' . $this->playlistId . '. '
+                . 'Crée une playlist avec le compte auth.php (debug.php / history.php) '
+                . 'ou change SPOTIFY_PLAYLIST_ID. '
+                . ($spotifyMsg !== '' ? 'Détail Spotify : ' . $spotifyMsg : '');
+        }
+
+        return 'API Spotify HTTP 403 (Forbidden) lors de : ' . $ctxLabel . '. '
+            . 'Compte me.id=' . $meIdLabel . ' (' . $meLabel . ') — '
+            . 'owner.id=' . $ownerIdLabel . ' (' . $ownerLabel . ') — '
+            . 'playlist id=' . $this->playlistId . '. '
+            . 'Vérifiez scopes (auth.php), endpoint /items, et Client ID. '
+            . self::devModeUserManagementHint()
             . ($spotifyMsg !== '' ? ' Détail Spotify : ' . $spotifyMsg : '');
     }
 
@@ -581,11 +745,17 @@ final class SpotifyClient
         }
 
         $expiresIn = (int) ($tokens['expires_in'] ?? 3600);
+        $scope = (string) ($tokens['scope'] ?? '');
+        if ($scope === '') {
+            $existing = self::readTokenFile($tokenPath);
+            $oldScope = $existing['scope'] ?? null;
+            $scope = is_string($oldScope) && $oldScope !== '' ? $oldScope : self::SCOPES;
+        }
         $payload = [
             'access_token'  => (string) ($tokens['access_token'] ?? ''),
             'refresh_token' => (string) ($tokens['refresh_token'] ?? ''),
             'token_type'    => (string) ($tokens['token_type'] ?? 'Bearer'),
-            'scope'         => (string) ($tokens['scope'] ?? self::SCOPES),
+            'scope'         => $scope,
             'expires_in'    => $expiresIn,
             'expires_at'    => time() + $expiresIn,
             'obtained_at'   => gmdate('c'),
@@ -641,6 +811,32 @@ final class SpotifyClient
         ?array $jsonBody = null,
         string $context = ''
     ): array {
+        $raw = $this->apiRequestRaw($method, $path, $jsonBody, $context);
+        if ($raw['status'] === 204 || ($raw['body'] === '' && $raw['status'] < 400)) {
+            return [];
+        }
+
+        $data = json_decode($raw['body'], true);
+        if ($raw['status'] >= 400) {
+            throw new SpotifyClientError(
+                $this->formatApiError($raw['status'], $data, $raw['body'], $context)
+                . ' [HTTP ' . $raw['status'] . ' ' . strtoupper($method) . ' ' . $raw['url'] . ']'
+            );
+        }
+
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * @param array<string, mixed>|null $jsonBody
+     * @return array{ok:bool,status:int,body:string,url:string,request_body:?string}
+     */
+    public function apiRequestRaw(
+        string $method,
+        string $path,
+        ?array $jsonBody = null,
+        string $context = ''
+    ): array {
         if ($this->accessToken === '' || time() >= $this->expiresAt - 30) {
             $this->ensureAccessToken();
         }
@@ -652,7 +848,7 @@ final class SpotifyClient
         ];
         $body = null;
         if ($jsonBody !== null) {
-            $encoded = json_encode($jsonBody);
+            $encoded = json_encode($jsonBody, JSON_UNESCAPED_SLASHES);
             if ($encoded === false) {
                 throw new SpotifyClientError('JSON invalide pour requête Spotify');
             }
@@ -660,24 +856,33 @@ final class SpotifyClient
             $body = $encoded;
         }
 
+        $this->logger?->info(
+            'Spotify ' . strtoupper($method) . ' ' . $url
+            . ($body !== null ? ' body=' . $body : '')
+            . ($context !== '' ? ' [' . $context . ']' : '')
+        );
+
         try {
             $res = Http::request($method, $url, $body, $headers, self::TIMEOUT);
         } catch (Throwable $e) {
             throw new SpotifyClientError('Échec API Spotify : ' . $e->getMessage(), 0, $e);
         }
 
-        if ($res['status'] === 204 || ($res['body'] === '' && $res['status'] < 400)) {
-            return [];
-        }
-
-        $data = json_decode($res['body'], true);
-        if ($res['status'] >= 400) {
-            throw new SpotifyClientError(
-                $this->formatApiError($res['status'], $data, $res['body'], $context)
+        $ok = $res['status'] >= 200 && $res['status'] < 300;
+        if (!$ok) {
+            $this->logger?->warning(
+                'Spotify HTTP ' . $res['status'] . ' ' . strtoupper($method) . ' ' . $url
+                . ' → ' . substr($res['body'], 0, 500)
             );
         }
 
-        return is_array($data) ? $data : [];
+        return [
+            'ok'           => $ok,
+            'status'       => $res['status'],
+            'body'         => $res['body'],
+            'url'          => $url,
+            'request_body' => $body,
+        ];
     }
 
     /**
@@ -697,10 +902,11 @@ final class SpotifyClient
         }
 
         $ctxLabel = match ($context) {
-            'playlist_items' => 'chargement des titres de la playlist',
-            'playlist_add'   => 'ajout à la playlist',
-            'search'         => 'recherche de titre',
-            default          => $context !== '' ? $context : 'requête API',
+            'playlist_items'  => 'chargement des titres de la playlist',
+            'playlist_add'    => 'ajout à la playlist',
+            'playlist_create' => 'création de playlist',
+            'search'          => 'recherche de titre',
+            default           => $context !== '' ? $context : 'requête API',
         };
 
         if ($status === 403) {
