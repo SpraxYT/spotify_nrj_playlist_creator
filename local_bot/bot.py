@@ -21,6 +21,7 @@ from nrj_client import (
     NrjClientError,
     NrjSong,
     fetch_current_song,
+    fetch_day_history,
     fetch_recent_songs,
     is_junk,
 )
@@ -35,6 +36,8 @@ MIN_BACKOFF = 5
 MAX_BACKOFF = 300
 MAX_MIRROR_ADDS = 18
 RECENT_MIRROR_CHECK = 12
+# Backfill journée : ~100–200 uniques ; plafond large pour tout importer
+MAX_BACKFILL_ADDS = 250
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,25 +47,26 @@ logging.basicConfig(
 logger = logging.getLogger("nrj-spotify-local")
 
 
-def load_config() -> dict[str, str | int]:
+def load_config(*, require_spotify: bool = True) -> dict[str, str | int]:
     # .env projet (racine) puis éventuel local_bot/.env
     load_dotenv(PROJECT_ROOT / ".env")
     load_dotenv(LOCAL_BOT_DIR / ".env")
 
-    required = (
-        "SPOTIFY_CLIENT_ID",
-        "SPOTIFY_CLIENT_SECRET",
-        "SPOTIFY_REDIRECT_URI",
-        "SPOTIFY_PLAYLIST_ID",
-    )
-    missing = [key for key in required if not os.getenv(key)]
-    if missing:
-        logger.error(
-            "Variables manquantes dans .env : %s. "
-            "Copiez local_bot/.env.example vers la racine (.env).",
-            ", ".join(missing),
+    if require_spotify:
+        required = (
+            "SPOTIFY_CLIENT_ID",
+            "SPOTIFY_CLIENT_SECRET",
+            "SPOTIFY_REDIRECT_URI",
+            "SPOTIFY_PLAYLIST_ID",
         )
-        sys.exit(1)
+        missing = [key for key in required if not os.getenv(key)]
+        if missing:
+            logger.error(
+                "Variables manquantes dans .env : %s. "
+                "Copiez local_bot/.env.example vers la racine (.env).",
+                ", ".join(missing),
+            )
+            sys.exit(1)
 
     try:
         poll = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
@@ -70,10 +74,10 @@ def load_config() -> dict[str, str | int]:
         poll = 45
 
     return {
-        "client_id": os.environ["SPOTIFY_CLIENT_ID"],
-        "client_secret": os.environ["SPOTIFY_CLIENT_SECRET"],
-        "redirect_uri": os.environ["SPOTIFY_REDIRECT_URI"],
-        "playlist_id": os.environ["SPOTIFY_PLAYLIST_ID"],
+        "client_id": os.getenv("SPOTIFY_CLIENT_ID", ""),
+        "client_secret": os.getenv("SPOTIFY_CLIENT_SECRET", ""),
+        "redirect_uri": os.getenv("SPOTIFY_REDIRECT_URI", ""),
+        "playlist_id": os.getenv("SPOTIFY_PLAYLIST_ID", ""),
         "webradio_id": os.getenv("NRJ_WEBRADIO_ID", "158"),
         "stream_url": os.getenv("NRJ_STREAM_URL") or "",
         "poll_interval": max(15, poll),
@@ -207,16 +211,24 @@ def process_once(
 
 
 def run_backfill(sync: SpotifyPlaylistSync, webradio_id: str) -> None:
-    songs = fetch_recent_songs(webradio_id)
-    logger.info("Backfill — %d titre(s) musicaux (miroir / historique).", len(songs))
+    """
+    Importe la journée NRJ : chansons-diffusees (historique long) puis
+    miroir en complément. Titres uniques uniquement (rejeux exclus).
+    """
+    songs = fetch_day_history(webradio_id)
+    logger.info(
+        "Backfill jour — %d titre(s) uniques "
+        "(chansons-diffusees + miroir complémentaire).",
+        len(songs),
+    )
     # Du plus ancien au plus récent pour un ordre playlist plus naturel
     pending = list(reversed(songs))
     sync_mirror(
         sync,
         pending,
         skip=None,
-        max_adds=50,
-        label="Backfill",
+        max_adds=MAX_BACKFILL_ADDS,
+        label="Backfill jour",
     )
 
 
@@ -265,10 +277,35 @@ def main() -> None:
     )
     parser.add_argument(
         "--backfill",
+        "--backfill-day",
+        dest="backfill",
         action="store_true",
-        help="Importe l’historique miroir complet manquant, puis quitte.",
+        help=(
+            "Importe la journée NRJ (chansons-diffusees d’abord, "
+            "miroir en complément), puis quitte."
+        ),
+    )
+    parser.add_argument(
+        "--probe-history",
+        action="store_true",
+        help="Compte les titres parsés (sans toucher Spotify), puis quitte.",
     )
     args = parser.parse_args()
+
+    if args.probe_history:
+        config = load_config(require_spotify=False)
+        webradio_id = str(config["webradio_id"])
+        try:
+            songs = fetch_day_history(webradio_id)
+            print(f"Titres uniques parsés : {len(songs)}")
+            for i, song in enumerate(songs[:15], 1):
+                print(f"  {i:3d}. {song.display()}")
+            if len(songs) > 15:
+                print(f"  … ({len(songs) - 15} de plus)")
+        except NrjClientError as exc:
+            logger.error("%s", exc)
+            sys.exit(1)
+        return
 
     config = load_config()
     sync = SpotifyPlaylistSync(

@@ -8,6 +8,7 @@ Deux modes :
 |---|---|---|
 | Usage | Machine chez vous (IP résidentielle) | Cron / aaPanel / serveur |
 | Now-playing | API NRJ → ICY → radio-api → miroir | ICY → radio-api → miroir (nrj.fr souvent CF) |
+| Historique / backfill | **chansons-diffusees** (journée ~100+ uniques) + miroir | Miroir seul (~30–40, CF bloque nrj.fr) |
 | Config | `.env` à la racine | `config.php` |
 
 Les promos (« NRJ EURO HOT 30 », etc.) sont filtrées. Un repli déjà en playlist
@@ -33,8 +34,13 @@ cp local_bot/.env.example .env   # si pas encore de .env
 # Une passe
 python local_bot/bot.py --once
 
-# Historique miroir → titres manquants
+# Journée NRJ → titres manquants (chansons-diffusees + miroir)
 python local_bot/bot.py --backfill
+# alias :
+python local_bot/bot.py --backfill-day
+
+# Compter sans toucher Spotify
+python local_bot/bot.py --probe-history
 
 # Boucle
 python local_bot/bot.py

@@ -497,7 +497,18 @@ def _parse_mirror_html(html: str) -> list[NrjSong]:
     return songs
 
 
-def _parse_history_html(html: str) -> list[NrjSong]:
+def _fingerprint(artist: str, title: str) -> str:
+    return f"{artist.casefold().strip()}|{title.casefold().strip()}"
+
+
+def _parse_history_html(html: str, *, unique: bool = True) -> list[NrjSong]:
+    """
+    Parse la page officielle chansons-diffusees.
+
+    Ordre : plus récent → plus ancien (comme sur le site).
+    Si unique=True, déduplique par artiste|titre (rejeux exclus ;
+    les rediffusions consécutives ou non n’ajoutent qu’une entrée Spotify).
+    """
     blocks = _ITEM_SPLIT.split(html)[1:]
     songs: list[NrjSong] = []
     seen: set[str] = set()
@@ -513,11 +524,26 @@ def _parse_history_html(html: str) -> list[NrjSong]:
         clip_m = _CLIP_RE.search(block)
         clip = (clip_m.group(1).strip() if clip_m else "") or None
         song_id = _stable_song_id(artist=artist, title=title, clip=clip)
-        if song_id in seen:
-            continue
-        seen.add(song_id)
+        if unique:
+            fp = _fingerprint(artist, title)
+            if fp in seen:
+                continue
+            seen.add(fp)
         songs.append(NrjSong(song_id=song_id, artist=artist, title=title))
     return songs
+
+
+def _merge_unique(primary: list[NrjSong], extra: list[NrjSong]) -> list[NrjSong]:
+    """Conserve l’ordre de primary, complète avec les titres absents de extra."""
+    seen = {_fingerprint(s.artist, s.title) for s in primary}
+    out = list(primary)
+    for song in extra:
+        fp = _fingerprint(song.artist, song.title)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append(song)
+    return out
 
 
 def fetch_recent_from_mirror() -> list[NrjSong]:
@@ -534,31 +560,96 @@ def fetch_recent_from_mirror() -> list[NrjSong]:
     return songs
 
 
-def fetch_recent_songs(webradio_id: str | int = 158) -> list[NrjSong]:
-    """Historique récent : miroir d’abord, puis page officielle."""
+def fetch_chansons_diffusees(webradio_id: str | int = 158) -> list[NrjSong]:
+    """Historique complet du jour depuis nrj.fr/chansons-diffusees (IP locale)."""
+    webradio_id = str(webradio_id)
+    params = {"webradio": webradio_id, "_": str(int(time.time()))}
+    url = f"{NRJ_HISTORY_URL}?{urlencode(params)}"
+    html = _http_get(url, accept="text/html,application/xhtml+xml")
+    # Comptage brut (avec rejeux) pour les logs
+    raw_plays = len(_parse_history_html(html, unique=False))
+    songs = _parse_history_html(html, unique=True)
+    if not songs:
+        raise NrjClientError(
+            "chansons-diffusees : aucun titre musical parsé "
+            "(structure HTML peut-être changée)."
+        )
+    logger.info(
+        "Historique NRJ via chansons-diffusees : %d unique(s) "
+        "(%d diffusion(s) brutes, promos exclues).",
+        len(songs),
+        raw_plays,
+    )
+    return songs
+
+
+def fetch_day_history(webradio_id: str | int = 158) -> list[NrjSong]:
+    """
+    Journée complète pour backfill local :
+    1. page officielle chansons-diffusees (historique long)
+    2. miroir en complément (titres absents de la page)
+    """
     webradio_id = str(webradio_id)
     errors: list[str] = []
+    primary: list[NrjSong] = []
+
+    try:
+        primary = fetch_chansons_diffusees(webradio_id)
+    except NrjClientError as exc:
+        errors.append(f"chansons-diffusees : {exc}")
+        logger.warning("chansons-diffusees indisponible : %s", exc)
+
+    mirror: list[NrjSong] = []
+    try:
+        mirror = fetch_recent_from_mirror()
+    except NrjClientError as exc:
+        errors.append(f"miroir : {exc}")
+        logger.warning("Miroir indisponible (complément) : %s", exc)
+
+    if primary and mirror:
+        merged = _merge_unique(primary, mirror)
+        added = len(merged) - len(primary)
+        if added:
+            logger.info(
+                "Backfill jour : +%d titre(s) via miroir (total %d).",
+                added,
+                len(merged),
+            )
+        return merged
+    if primary:
+        return primary
+    if mirror:
+        logger.info(
+            "Backfill jour : repli miroir seul (%d titre(s)) — "
+            "page nrj.fr inaccessible (CF / réseau).",
+            len(mirror),
+        )
+        return mirror
+
+    raise NrjClientError(
+        "Historique jour NRJ inaccessible. Détails : " + " | ".join(errors)
+    )
+
+
+def fetch_recent_songs(webradio_id: str | int = 158) -> list[NrjSong]:
+    """
+    Historique récent pour sync live :
+    page officielle d’abord (IP résidentielle), miroir en secours.
+    """
+    webradio_id = str(webradio_id)
+    errors: list[str] = []
+
+    try:
+        return fetch_chansons_diffusees(webradio_id)
+    except NrjClientError as exc:
+        errors.append(f"chansons-diffusees : {exc}")
+        logger.warning("Historique chansons-diffusees indisponible : %s", exc)
 
     try:
         return fetch_recent_from_mirror()
     except NrjClientError as exc:
         errors.append(f"miroir : {exc}")
         logger.warning("Historique miroir indisponible : %s", exc)
-
-    params = {"webradio": webradio_id, "_": str(int(time.time()))}
-    url = f"{NRJ_HISTORY_URL}?{urlencode(params)}"
-    try:
-        html = _http_get(url, accept="text/html,application/xhtml+xml")
-        songs = _parse_history_html(html)
-        if songs:
-            logger.info(
-                "Historique NRJ via chansons-diffusees (%d titre(s)).",
-                len(songs),
-            )
-            return songs
-        errors.append("chansons-diffusees : vide")
-    except NrjClientError as exc:
-        errors.append(f"chansons-diffusees : {exc}")
 
     raise NrjClientError(
         "Historique distant NRJ inaccessible. Détails : " + " | ".join(errors)
