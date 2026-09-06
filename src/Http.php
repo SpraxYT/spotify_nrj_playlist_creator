@@ -35,7 +35,7 @@ final class Http
 
     /**
      * @param array<string, string> $headers
-     * @return array{status:int, body:string}
+     * @return array{status:int, body:string, headers:array<string, string>}
      */
     public static function request(
         string $method,
@@ -47,8 +47,51 @@ final class Http
         if (function_exists('curl_init')) {
             return self::curlRaw($method, $url, $body, $headers, $timeout);
         }
-        $raw = self::stream($method, $url, $body, $headers, $timeout, true);
-        return $raw;
+        return self::stream($method, $url, $body, $headers, $timeout, true);
+    }
+
+    /**
+     * Détecte une page challenge Cloudflare (souvent 403 « Just a moment… »).
+     */
+    public static function isCloudflareChallenge(int $status, string $body, array $responseHeaders = []): bool
+    {
+        $hay = strtolower($body);
+        if (
+            str_contains($hay, 'just a moment')
+            || str_contains($hay, 'cf-browser-verification')
+            || str_contains($hay, 'cdn-cgi/challenge')
+            || str_contains($hay, 'challenge-platform')
+            || str_contains($hay, '_cf_chl')
+        ) {
+            return true;
+        }
+
+        foreach ($responseHeaders as $name => $value) {
+            $n = strtolower((string) $name);
+            if ($n === 'cf-ray' || $n === 'cf-mitigated') {
+                if ($status === 403 || $status === 503) {
+                    return true;
+                }
+            }
+            if ($n === 'server' && str_contains(strtolower((string) $value), 'cloudflare')
+                && ($status === 403 || $status === 503)
+                && (str_contains($hay, 'cloudflare') || str_contains($hay, 'attention required'))
+            ) {
+                return true;
+            }
+        }
+
+        return $status === 403 && str_contains($hay, 'cloudflare');
+    }
+
+    public static function cloudflareErrorMessage(string $url = ''): string
+    {
+        $target = $url !== '' ? ' (' . $url . ')' : '';
+        return 'Accès bloqué par Cloudflare'
+            . $target
+            . '. Les IP de datacenter / VPS sont souvent filtrées. '
+            . 'Utilisez run.php en cron pour le titre en cours (API JSON), '
+            . 'ou lancez l’historique depuis une IP résidentielle.';
     }
 
     /**
@@ -62,6 +105,9 @@ final class Http
         int $timeout
     ): string {
         $res = self::curlRaw($method, $url, $body, $headers, $timeout);
+        if (self::isCloudflareChallenge($res['status'], $res['body'], $res['headers'])) {
+            throw new RuntimeException(self::cloudflareErrorMessage($url));
+        }
         if ($res['status'] < 200 || $res['status'] >= 300) {
             throw new RuntimeException(
                 'HTTP ' . $res['status'] . ' : ' . substr($res['body'], 0, 200)
@@ -72,7 +118,7 @@ final class Http
 
     /**
      * @param array<string, string> $headers
-     * @return array{status:int, body:string}
+     * @return array{status:int, body:string, headers:array<string, string>}
      */
     private static function curlRaw(
         string $method,
@@ -91,12 +137,21 @@ final class Http
             $hdr[] = $k . ': ' . $v;
         }
 
+        $responseHeaders = [];
         $opts = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_TIMEOUT        => $timeout,
             CURLOPT_CUSTOMREQUEST  => strtoupper($method),
             CURLOPT_HTTPHEADER     => $hdr,
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$responseHeaders): int {
+                $len = strlen($line);
+                $parts = explode(':', $line, 2);
+                if (count($parts) === 2) {
+                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+                }
+                return $len;
+            },
         ];
         if ($body !== null) {
             $opts[CURLOPT_POSTFIELDS] = $body;
@@ -112,12 +167,16 @@ final class Http
             throw new RuntimeException('Échec HTTP : ' . $err);
         }
 
-        return ['status' => $status, 'body' => (string) $response];
+        return [
+            'status'  => $status,
+            'body'    => (string) $response,
+            'headers' => $responseHeaders,
+        ];
     }
 
     /**
      * @param array<string, string> $headers
-     * @return ($withStatus is true ? array{status:int, body:string} : string)
+     * @return ($withStatus is true ? array{status:int, body:string, headers:array<string, string>} : string)
      */
     private static function stream(
         string $method,
@@ -134,10 +193,10 @@ final class Http
 
         $opts = [
             'http' => [
-                'method'        => strtoupper($method),
-                'header'        => $hdrLines,
-                'timeout'       => $timeout,
-                'ignore_errors' => true,
+                'method'          => strtoupper($method),
+                'header'          => $hdrLines,
+                'timeout'         => $timeout,
+                'ignore_errors'   => true,
                 'follow_location' => 1,
             ],
             'ssl' => [
@@ -156,14 +215,27 @@ final class Http
         }
 
         $status = 0;
-        if (isset($http_response_header[0])
-            && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)
-        ) {
-            $status = (int) $m[1];
+        $responseHeaders = [];
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            if (isset($http_response_header[0])
+                && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)
+            ) {
+                $status = (int) $m[1];
+            }
+            foreach ($http_response_header as $line) {
+                $parts = explode(':', $line, 2);
+                if (count($parts) === 2) {
+                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+                }
+            }
+        }
+
+        if (self::isCloudflareChallenge($status, $response, $responseHeaders)) {
+            throw new RuntimeException(self::cloudflareErrorMessage($url));
         }
 
         if ($withStatus) {
-            return ['status' => $status, 'body' => $response];
+            return ['status' => $status, 'body' => $response, 'headers' => $responseHeaders];
         }
 
         if ($status !== 0 && ($status < 200 || $status >= 300)) {

@@ -159,7 +159,7 @@ if (!$authed) {
         <h1>Historique NRJ</h1>
         <form method="post"><button type="submit" name="logout" value="1" class="linkish">Déconnexion</button></form>
     </div>
-    <p class="muted">Récupère les titres récents de <a href="https://www.nrj.fr/chansons-diffusees" rel="noopener">chansons-diffusees</a>, puis les ajoute à la playlist Spotify (sans doublons).</p>
+    <p class="muted">Récupère les titres récents NRJ (API / miroir résistant à Cloudflare, puis <a href="https://www.nrj.fr/chansons-diffusees" rel="noopener">chansons-diffusees</a>), puis les ajoute à la playlist Spotify (sans doublons). Sur un VPS, si Cloudflare bloque encore la page officielle, le miroir ou le cron <code>run.php</code> (titre en cours) restent utilisables.</p>
     <?php if ($error): ?><p class="err"><?= history_h($error) ?></p><?php endif; ?>
 
     <?php if ($result !== null): ?>
