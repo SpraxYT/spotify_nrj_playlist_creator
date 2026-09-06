@@ -687,10 +687,10 @@ final class NrjClient
     private function extractStreamTitle(string $raw): string
     {
         // StreamTitle='…'; (apostrophes internes OK)
-        if (preg_match("/StreamTitle='([^;]*)';/s", $raw, $m)) {
+        if (preg_match("/StreamTitle='([^;]*)'\s*;/s", $raw, $m)) {
             return html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
-        if (preg_match('/StreamTitle="([^;]*)";/s', $raw, $m)) {
+        if (preg_match('/StreamTitle="([^;]*)"\s*;/s', $raw, $m)) {
             return html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
         // Sans guillemets : StreamTitle=Artist - Title;
