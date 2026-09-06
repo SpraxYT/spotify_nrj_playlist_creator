@@ -8,8 +8,9 @@ declare(strict_types=1);
  * CLI  : php run.php [--backfill]
  * HTTP : /run.php?key=CRON_SECRET[&backfill=1]
  *
- * Chaque passage : capture le titre en cours + synchronise l’historique miroir
- * (titres musicaux manquants, max MAX_ADDS_PER_RUN) vers Spotify.
+ * Cron recommandé : * * * * * (chaque minute) pour coller au direct NRJ.
+ * Chaque passage : ICY (titre live) d’abord, puis historique miroir du plus
+ * récent au plus ancien (max MAX_ADDS_PER_RUN ajouts Spotify).
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -18,7 +19,10 @@ $root = __DIR__;
 $isCli = PHP_SAPI === 'cli';
 
 /** Limite d’ajouts Spotify par passage cron (rate limit). */
-const MAX_ADDS_PER_RUN = 8;
+const MAX_ADDS_PER_RUN = 18;
+
+/** Nombre de titres locaux les plus récents à re-vérifier chaque passage. */
+const RECENT_HISTORY_CHECK = 10;
 
 try {
     $config = Config::load($root);
@@ -100,6 +104,7 @@ function process_once(
     NrjHistoryStore $history,
     Logger $logger
 ): void {
+    // 1) Titre live ICY / API — prioritaire (le miroir est souvent en retard).
     $current = $nrj->fetchCurrentSong();
     if ($current !== null) {
         if ($history->remember($current)) {
@@ -109,29 +114,68 @@ function process_once(
         $logger->info('Aucun titre ICY/API valide en cours (pub / pause / promo).');
     }
 
-    $batch = [];
+    // 2) Miroir distant → fusion locale (ordre distant : plus récent en premier).
+    $remote = [];
     try {
         $remote = $nrj->fetchRecentSongs();
         $history->mergeRemote($remote);
-        $batch = $remote;
-        $logger->info('Sync historique distant : ' . count($batch) . ' titre(s) musicaux.');
+        $logger->info('Sync historique distant : ' . count($remote) . ' titre(s) musicaux.');
     } catch (NrjClientError $e) {
         $logger->info('Historique distant indisponible : ' . $e->getMessage());
-        if ($current !== null) {
-            $batch = [$current];
-        }
     }
+
+    // 3) Lot Spotify : live d’abord, puis les N plus récents (miroir/local), newest-first.
+    $batch = [];
+    if ($current !== null) {
+        $batch[] = $current;
+    }
+
+    $recentLocal = array_slice($history->songs(), 0, RECENT_HISTORY_CHECK);
+    $batch = merge_songs_newest_first($batch, $recentLocal);
+    $batch = merge_songs_newest_first($batch, $remote);
 
     if ($batch === []) {
         $logger->info('Rien à ajouter à Spotify pour ce passage.');
         return;
     }
 
+    $logger->info(
+        'File d’ajout (newest-first) : ' . count($batch) . ' titre(s), '
+        . 'plafond ' . MAX_ADDS_PER_RUN . '.'
+    );
     sync_pending($batch, $spotify, $logger, MAX_ADDS_PER_RUN);
 }
 
 /**
- * @param list<NrjSong> $songs plus récents en premier (ou ordre quelconque)
+ * Fusionne des listes (plus récent en premier) sans doublons.
+ *
+ * @param list<NrjSong> ...$lists
+ * @return list<NrjSong>
+ */
+function merge_songs_newest_first(array ...$lists): array
+{
+    $out = [];
+    $seen = [];
+    foreach ($lists as $list) {
+        foreach ($list as $song) {
+            if (!$song instanceof NrjSong) {
+                continue;
+            }
+            $key = $song->songId . '|' . str_lower($song->artist) . '|' . str_lower($song->title);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $out[] = $song;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Ajoute les titres manquants à Spotify — ordre : plus récent en premier.
+ *
+ * @param list<NrjSong> $songs plus récents en premier
  */
 function sync_pending(
     array $songs,
@@ -139,11 +183,10 @@ function sync_pending(
     Logger $logger,
     int $maxAdds
 ): void {
-    $pending = array_reverse($songs);
     $counts = ['added' => 0, 'already' => 0, 'not_found' => 0, 'skipped' => 0, 'junk' => 0];
     $adds = 0;
 
-    foreach ($pending as $song) {
+    foreach ($songs as $song) {
         if (NrjClient::isJunk($song->artist, $song->title)) {
             $counts['junk']++;
             continue;
@@ -210,6 +253,6 @@ function run_backfill(
         return;
     }
 
-    $logger->info('Backfill — ' . count($songs) . ' titre(s) dans l’historique.');
+    $logger->info('Backfill — ' . count($songs) . ' titre(s) dans l’historique (newest-first).');
     sync_pending($songs, $spotify, $logger, 50);
 }

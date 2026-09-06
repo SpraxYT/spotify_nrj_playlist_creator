@@ -36,14 +36,24 @@ Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est sto
 ## Utilisation
 
 ```bash
-# Titre en cours (cron) — source ICY, enregistre aussi data/nrj_history.json
+# Titre en cours (cron) — ICY live d’abord, puis miroir newest-first
 php run.php
 
 # Import depuis l’historique local
 php run.php --backfill
 ```
 
-HTTP :
+### Cron (recommandé : chaque minute)
+
+Le miroir HTML est souvent en retard de quelques titres sur le direct. Pour coller au live :
+
+```cron
+* * * * * php /chemin/vers/run.php >/dev/null 2>&1
+```
+
+Ou en HTTP : `* * * * * curl -s "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET" >/dev/null 2>&1`
+
+HTTP manuel :
 
 ```bash
 curl "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET"
@@ -53,7 +63,7 @@ curl "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET"
 
 Ouvrez `history.php` : liste l’historique **local** construit par le cron, permet de capturer le titre en cours et d’ajouter le lot à Spotify.
 
-Sur un VPS, l’historique distant `chansons-diffusees` est en général inaccessible (Cloudflare). Plus le cron tourne souvent (ex. chaque minute), plus l’historique local se remplit.
+Sur un VPS, l’historique distant `chansons-diffusees` est en général inaccessible (Cloudflare). Avec un cron **chaque minute**, l’ICY comble le retard du miroir.
 
 Logs : stdout + `data/run.log`. Cache : `data/cache.json`. Historique local : `data/nrj_history.json`.
 

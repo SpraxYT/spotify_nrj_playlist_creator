@@ -36,9 +36,9 @@ final class NrjClient
     private const RADIO_API_NOW =
         'https://prod.radio-api.net/stations/now-playing?stationIds=nrjfrance';
     private const TIMEOUT = 12;
-    private const ICY_TIMEOUT = 10;
-    private const ICY_MAX_BLOCKS = 12;
-    private const ICY_MAX_ATTEMPTS = 3;
+    private const ICY_TIMEOUT = 12;
+    private const ICY_MAX_BLOCKS = 16;
+    private const ICY_MAX_ATTEMPTS = 4;
 
     /** Flux MP3 connus (hors Cloudflare). */
     private const STREAM_URLS = [
@@ -242,15 +242,24 @@ final class NrjClient
     {
         $lastMeta = '';
         for ($attempt = 1; $attempt <= self::ICY_MAX_ATTEMPTS; $attempt++) {
-            $meta = $this->readIcyStreamTitle($this->streamUrl);
+            try {
+                $meta = $this->readIcyStreamTitle($this->streamUrl);
+            } catch (NrjClientError $e) {
+                $this->logger?->warning(
+                    'ICY tentative ' . $attempt . '/' . self::ICY_MAX_ATTEMPTS . ' : ' . $e->getMessage()
+                );
+                usleep(350000 * $attempt);
+                continue;
+            }
             if ($meta === null) {
+                usleep(300000);
                 continue;
             }
             $lastMeta = $meta['raw'];
 
             if (!empty($meta['is_ad'])) {
                 $this->logger?->info('ICY : publicité / preroll détecté, nouvel essai…');
-                usleep(400000);
+                usleep(450000);
                 continue;
             }
 
@@ -262,6 +271,8 @@ final class NrjClient
 
             $parsed = $this->parseArtistTitle($titleRaw);
             if ($parsed === null) {
+                $this->logger?->info('ICY StreamTitle non parsé : ' . substr($titleRaw, 0, 80));
+                usleep(250000);
                 continue;
             }
 
@@ -452,12 +463,7 @@ final class NrjClient
                 continue;
             }
 
-            $streamTitle = '';
-            if (preg_match("/StreamTitle='([^']*)'/", $raw, $m)) {
-                $streamTitle = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            } elseif (preg_match('/StreamTitle="([^"]*)"/', $raw, $m)) {
-                $streamTitle = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            }
+            $streamTitle = $this->extractStreamTitle($raw);
 
             $isAd = (bool) preg_match(
                 "/adw_ad='true'|insertionType='(?:preroll|midroll|ad)'/i",
@@ -675,6 +681,27 @@ final class NrjClient
     }
 
     /**
+     * Extrait StreamTitle depuis un bloc métadonnées ICY (guillemets simples/doubles ou brut).
+     * Contenu jusqu’au `;` pour tolérer les apostrophes dans les noms d’artistes.
+     */
+    private function extractStreamTitle(string $raw): string
+    {
+        // StreamTitle='…'; (apostrophes internes OK)
+        if (preg_match("/StreamTitle='([^;]*)';/s", $raw, $m)) {
+            return html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        if (preg_match('/StreamTitle="([^;]*)";/s', $raw, $m)) {
+            return html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        // Sans guillemets : StreamTitle=Artist - Title;
+        if (preg_match('/StreamTitle=([^;]+)/i', $raw, $m)) {
+            $val = trim($m[1], " \t\"'");
+            return html_entity_decode($val, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        return '';
+    }
+
+    /**
      * @return array{0:string,1:string}|null
      */
     private function parseArtistTitle(string $combined): ?array
@@ -689,6 +716,15 @@ final class NrjClient
             $artist = trim($m[1]);
             $title = trim($m[2]);
             if ($artist !== '' && $title !== '') {
+                return [$artist, $title];
+            }
+        }
+
+        // Variante "Artist: Title"
+        if (preg_match('/^(.+?)\s*:\s+(.+)$/u', $combined, $m)) {
+            $artist = trim($m[1]);
+            $title = trim($m[2]);
+            if ($artist !== '' && $title !== '' && !str_contains($artist, 'http')) {
                 return [$artist, $title];
             }
         }
