@@ -303,12 +303,21 @@ final class SpotifyClient
     }
 
     /**
+     * Skip seulement si ajouté avec succès ou URI déjà en playlist.
+     * Les anciens not_found restent réessayables.
+     */
+    public function isHandledSuccessfully(string $nrjSongId, string $artist = '', string $title = ''): bool
+    {
+        return $this->cache->isHandledSuccessfully($nrjSongId, $artist, $title);
+    }
+
+    /**
      * @return 'added'|'already'|'not_found'
      */
     public function addTrack(string $nrjSongId, string $artist, string $title): string
     {
-        if ($this->cache->hasSeenNrjSong($nrjSongId)) {
-            $this->logger?->info('Déjà traité (cache NRJ) : ' . $artist . ' - ' . $title);
+        if ($this->cache->isHandledSuccessfully($nrjSongId, $artist, $title)) {
+            $this->logger?->info('Déjà en playlist / traité : ' . $artist . ' - ' . $title);
             return 'already';
         }
 

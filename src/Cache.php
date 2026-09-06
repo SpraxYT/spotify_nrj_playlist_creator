@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 /**
  * Cache local des titres NRJ déjà traités (+ URIs Spotify connus).
+ *
+ * Un titre n’est « réglé » (skip) que s’il a été ajouté (status=added)
+ * ou confirmé déjà en playlist (status=already + URI). Les not_found
+ * restent réessayables (ex. live radio-api avec un libellé plus propre).
  */
 final class Cache
 {
@@ -12,11 +16,14 @@ final class Cache
     /** @var list<array<string, mixed>> */
     private array $entries = [];
 
-    /** @var array<string, true> */
-    private array $seenNrjIds = [];
+    /** @var array<string, string> nrjSongId => last status */
+    private array $statusByNrjId = [];
 
     /** @var array<string, true> */
     private array $uris = [];
+
+    /** @var array<string, string> fingerprint artist|title => status */
+    private array $statusByFingerprint = [];
 
     public function __construct(string $path)
     {
@@ -26,7 +33,31 @@ final class Cache
 
     public function hasSeenNrjSong(string $nrjSongId): bool
     {
-        return isset($this->seenNrjIds[$nrjSongId]);
+        return isset($this->statusByNrjId[$nrjSongId]);
+    }
+
+    /**
+     * True seulement si on a déjà ajouté le titre ou confirmé l’URI en playlist.
+     */
+    public function isHandledSuccessfully(
+        string $nrjSongId,
+        string $artist = '',
+        string $title = ''
+    ): bool {
+        $status = $this->statusByNrjId[$nrjSongId] ?? null;
+        if ($status === 'added' || $status === 'already') {
+            return true;
+        }
+
+        if ($artist !== '' && $title !== '') {
+            $fp = $this->fingerprint($artist, $title);
+            $fpStatus = $this->statusByFingerprint[$fp] ?? null;
+            if ($fpStatus === 'added' || $fpStatus === 'already') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public function hasUri(string $uri): bool
@@ -58,9 +89,12 @@ final class Cache
         string $title,
         string $status
     ): void {
-        $this->seenNrjIds[$nrjSongId] = true;
+        $this->statusByNrjId[$nrjSongId] = $status;
         if ($uri !== null && $uri !== '') {
             $this->uris[$uri] = true;
+        }
+        if ($artist !== '' && $title !== '') {
+            $this->statusByFingerprint[$this->fingerprint($artist, $title)] = $status;
         }
 
         $this->entries[] = [
@@ -73,6 +107,11 @@ final class Cache
         ];
 
         $this->save();
+    }
+
+    private function fingerprint(string $artist, string $title): string
+    {
+        return str_lower(trim($artist)) . '|' . str_lower(trim($title));
     }
 
     private function load(): void
@@ -103,11 +142,19 @@ final class Cache
             $this->entries[] = $entry;
             $nrjId = isset($entry['nrj_song_id']) ? (string) $entry['nrj_song_id'] : '';
             $uri = isset($entry['uri']) ? (string) $entry['uri'] : '';
+            $status = isset($entry['status']) ? (string) $entry['status'] : 'already';
+            $artist = isset($entry['artist']) ? (string) $entry['artist'] : '';
+            $title = isset($entry['title']) ? (string) $entry['title'] : '';
+
             if ($nrjId !== '') {
-                $this->seenNrjIds[$nrjId] = true;
+                // Dernier statut gagne (liste chronologique).
+                $this->statusByNrjId[$nrjId] = $status;
             }
             if ($uri !== '') {
                 $this->uris[$uri] = true;
+            }
+            if ($artist !== '' && $title !== '') {
+                $this->statusByFingerprint[$this->fingerprint($artist, $title)] = $status;
             }
         }
     }

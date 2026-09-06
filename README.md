@@ -45,13 +45,15 @@ php run.php --backfill
 
 ### Cron (recommandé : chaque minute)
 
-Le miroir HTML est souvent en retard de quelques titres sur le direct. Pour coller au live :
-
 ```cron
 * * * * * php /chemin/vers/run.php >/dev/null 2>&1
 ```
 
 Ou en HTTP : `* * * * * curl -s "https://votre-domaine.tld/run.php?key=VOTRE_CRON_SECRET" >/dev/null 2>&1`
+
+Pendant une **bannière pub** ICY (`adw_ad=true`), la musique joue déjà mais StreamTitle est vide :
+le bot bascule aussitôt sur radio-api / miroir et **ajoute le titre live à Spotify**
+(pas seulement l’historique local). Logs : `Ajout live : …` puis `Sync miroir …`.
 
 HTTP manuel :
 

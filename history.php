@@ -144,7 +144,7 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $counts['junk']++;
                     continue;
                 }
-                if ($spotify->hasSeenNrjSong($song->songId)) {
+                if ($spotify->isHandledSuccessfully($song->songId, $song->artist, $song->title)) {
                     $counts['skipped']++;
                     $details[] = ['label' => $song->display(), 'status' => 'déjà traité'];
                     continue;
