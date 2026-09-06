@@ -30,7 +30,9 @@ Renseignez `config.php` (ne le committez jamais) :
 
 ## Autorisation (une fois)
 
-Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json`.
+Ouvrez `auth.php` dans le navigateur. Spotify redirige, le refresh token est stocké dans `data/token.json` (chemin absolu sous la racine du projet). Le consentement est forcé (`show_dialog=true`).
+
+Si une ré-autorisation n’écrit pas de `refresh_token`, révoquez l’app sur [spotify.com/account/apps](https://www.spotify.com/account/apps/) puis rouvrez `auth.php`. En cas de ré-auth sans nouveau refresh, l’ancien token déjà présent dans `token.json` est conservé.
 
 ## Utilisation
 

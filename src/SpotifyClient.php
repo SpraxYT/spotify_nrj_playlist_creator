@@ -54,6 +54,7 @@ final class SpotifyClient
 
     /**
      * Échange le code OAuth contre des tokens et les enregistre.
+     * Spotify omet parfois refresh_token en ré-auth : on conserve l’ancien s’il existe.
      *
      * @return array<string, mixed>
      */
@@ -71,8 +72,65 @@ final class SpotifyClient
         ]);
 
         $tokens = self::tokenRequest($clientId, $clientSecret, $payload);
+
+        $newRefresh = $tokens['refresh_token'] ?? null;
+        if (!is_string($newRefresh) || $newRefresh === '') {
+            $existing = self::readTokenFile($tokenPath);
+            $oldRefresh = $existing['refresh_token'] ?? null;
+            if (is_string($oldRefresh) && $oldRefresh !== '') {
+                $tokens['refresh_token'] = $oldRefresh;
+            }
+        }
+
         self::saveTokens($tokenPath, $tokens);
+
+        $savedRefresh = $tokens['refresh_token'] ?? null;
+        if (!is_string($savedRefresh) || $savedRefresh === '') {
+            throw new SpotifyClientError(
+                'Spotify n’a pas renvoyé de refresh_token. Révoquez l’accès de l’app sur '
+                . 'https://www.spotify.com/account/apps/ puis rouvrez auth.php '
+                . '(show_dialog force le consentement).'
+            );
+        }
+
         return $tokens;
+    }
+
+    /**
+     * Vérifie que le dossier data/ est créable/inscriptible.
+     */
+    public static function assertTokenPathWritable(string $tokenPath): void
+    {
+        $dir = dirname($tokenPath);
+        if (!is_dir($dir)) {
+            if (!@mkdir($dir, 0755, true) && !is_dir($dir)) {
+                throw new SpotifyClientError(
+                    'Impossible de créer le dossier data/ (' . $dir . '). '
+                    . 'Vérifiez les permissions du serveur (utilisateur PHP / www).'
+                );
+            }
+        }
+        if (!is_writable($dir)) {
+            throw new SpotifyClientError(
+                'Le dossier data/ n’est pas inscriptible (' . $dir . '). '
+                . 'Corrigez les permissions (chmod/chown) pour l’utilisateur PHP.'
+            );
+        }
+        if (is_file($tokenPath) && !is_writable($tokenPath)) {
+            throw new SpotifyClientError(
+                'Le fichier token.json existe mais n’est pas inscriptible (' . $tokenPath . ').'
+            );
+        }
+    }
+
+    /**
+     * Indique si token.json contient un refresh_token non vide.
+     */
+    public static function hasRefreshToken(string $tokenPath): bool
+    {
+        $tokens = self::readTokenFile($tokenPath);
+        $refresh = $tokens['refresh_token'] ?? null;
+        return is_string($refresh) && $refresh !== '';
     }
 
     public static function normalizeQueryPart(string $value): string
@@ -270,10 +328,18 @@ final class SpotifyClient
      */
     private function loadTokens(): array
     {
-        if (!is_file($this->tokenPath)) {
+        return self::readTokenFile($this->tokenPath);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function readTokenFile(string $tokenPath): array
+    {
+        if (!is_file($tokenPath)) {
             return [];
         }
-        $raw = file_get_contents($this->tokenPath);
+        $raw = file_get_contents($tokenPath);
         if ($raw === false || $raw === '') {
             return [];
         }
@@ -286,9 +352,15 @@ final class SpotifyClient
      */
     public static function saveTokens(string $tokenPath, array $tokens): void
     {
-        $dir = dirname($tokenPath);
-        if (!is_dir($dir)) {
-            mkdir($dir, 0755, true);
+        self::assertTokenPathWritable($tokenPath);
+
+        $refresh = $tokens['refresh_token'] ?? null;
+        if (!is_string($refresh) || $refresh === '') {
+            $existing = self::readTokenFile($tokenPath);
+            $old = $existing['refresh_token'] ?? null;
+            if (is_string($old) && $old !== '') {
+                $tokens['refresh_token'] = $old;
+            }
         }
 
         $expiresIn = (int) ($tokens['expires_in'] ?? 3600);
@@ -306,8 +378,11 @@ final class SpotifyClient
         if ($json === false) {
             throw new SpotifyClientError('Impossible d’encoder token.json');
         }
-        if (file_put_contents($tokenPath, $json . "\n", LOCK_EX) === false) {
-            throw new SpotifyClientError('Impossible d’écrire ' . $tokenPath);
+        if (@file_put_contents($tokenPath, $json . "\n", LOCK_EX) === false) {
+            throw new SpotifyClientError(
+                'Impossible d’écrire token.json (' . $tokenPath . '). '
+                . 'Vérifiez les permissions du dossier data/.'
+            );
         }
     }
 
